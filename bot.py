@@ -849,9 +849,16 @@ def _check_achievements(entry: dict, stat_key: str) -> list[dict]:
     return unlocked
 
 async def _record_activity(user_id: int, questions_delta: int = 0,
-                     pdfs_delta: int = 0, session_questions: int = 0) -> dict:
+                     pdfs_delta: int = 0, session_questions: int = 0,
+                     persist: bool = True) -> dict:
     """Update all stats. Returns dict of events for the caller to announce:
-    { "achievements": [...], "level_up": int | 0 }"""
+    { "achievements": [...], "level_up": int | 0 }
+
+    persist=False skips the save_analytics() call at the end — for callers
+    (the three poll-answer advance functions) that go on to mutate the
+    entry further and call save_analytics() themselves right after, so the
+    whole ANALYTICS dict doesn't get deep-copied and written to disk twice
+    for the same answer."""
     from datetime import datetime, timezone, timedelta
     today  = _today()
     entry  = _get_entry(user_id)
@@ -892,7 +899,8 @@ async def _record_activity(user_id: int, questions_delta: int = 0,
         entry["level"] = final_level
         new_level = final_level
 
-    await save_analytics()
+    if persist:
+        await save_analytics()
     return {"achievements": newly_unlocked, "level_up": new_level}
 
 async def _announce_events(context, chat_id: int, events: dict, settings_uid: int | None = None):
@@ -1819,7 +1827,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = await _record_activity(user_id)
+    events     = await _record_activity(user_id, persist=False)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -2023,7 +2031,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     xp_delta = per_question_xp + (XP_LECTURE_COMPLETE_BONUS if is_last else 0)
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = await _record_activity(user_id)
+    events     = await _record_activity(user_id, persist=False)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
@@ -4087,7 +4095,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         xp_delta = 0   # repeat attempt at a lecture already completed once — no XP farming
     session["xp_earned"] = session.get("xp_earned", 0) + xp_delta
 
-    events     = await _record_activity(user_id)
+    events     = await _record_activity(user_id, persist=False)
     user_entry = _get_entry(user_id)
     prev_streak = user_entry.get("lecture_correct_streak_current", 0)
     user_entry["lecture_questions_answered"]  += 1
