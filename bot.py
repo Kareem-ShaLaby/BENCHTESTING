@@ -4,6 +4,7 @@ import random
 import json
 import os
 import time
+import copy
 import asyncio
 import functools
 import html
@@ -737,7 +738,16 @@ def load_analytics() -> dict:
     return {}
 
 async def save_analytics():
-    await asyncio.to_thread(_atomic_write_json, ANALYTICS_FILE, ANALYTICS, indent=2, ensure_ascii=False)
+    # deepcopy BEFORE handing off to the background thread: to_thread runs
+    # _atomic_write_json (and therefore json.dump, which iterates the
+    # whole structure) on a separate OS thread while the event loop keeps
+    # running — any coroutine that mutates ANALYTICS while that thread is
+    # mid-iteration (e.g. another user's answer landing at the same
+    # moment) races json.dump and can throw "dictionary changed size
+    # during iteration" or worse, write corrupt/partial JSON. A snapshot
+    # copy freezes what gets written; the live dict stays free to mutate.
+    snapshot = copy.deepcopy(ANALYTICS)
+    await asyncio.to_thread(_atomic_write_json, ANALYTICS_FILE, snapshot, indent=2, ensure_ascii=False)
 
 ANALYTICS: dict = load_analytics()
 
@@ -1095,7 +1105,10 @@ def load_settings() -> dict:
     return {}
 
 async def save_settings():
-    await asyncio.to_thread(_atomic_write_json, SETTINGS_FILE, SETTINGS, indent=2, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required, not
+    # just defensive style — same to_thread-races-live-mutation risk.
+    snapshot = copy.deepcopy(SETTINGS)
+    await asyncio.to_thread(_atomic_write_json, SETTINGS_FILE, snapshot, indent=2, ensure_ascii=False)
 
 SETTINGS: dict = load_settings()
 
@@ -1251,7 +1264,9 @@ def load_lecture_results() -> dict:
     return {}
 
 async def save_lecture_results():
-    await asyncio.to_thread(_atomic_write_json, LECTURE_RESULTS_FILE, LECTURE_RESULTS, indent=2, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required.
+    snapshot = copy.deepcopy(LECTURE_RESULTS)
+    await asyncio.to_thread(_atomic_write_json, LECTURE_RESULTS_FILE, snapshot, indent=2, ensure_ascii=False)
 
 LECTURE_RESULTS: dict = load_lecture_results()
 
@@ -1429,7 +1444,14 @@ def _is_valid_mistake_entry(m) -> bool:
     return isinstance(m, dict) and all(k in m for k in ("mid", "year", "module", "subject"))
 
 async def save_mistakes_bank():
-    await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, MISTAKES_BANK, indent=2, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required — this is
+    # the exact function whose race the load test's "dictionary changed
+    # size during iteration" errors most likely came from: record_mistake
+    # appends to MISTAKES_BANK from many concurrent _advance_lecture_session
+    # calls while a background thread could simultaneously be mid-iteration
+    # serializing the same live list to JSON.
+    snapshot = copy.deepcopy(MISTAKES_BANK)
+    await asyncio.to_thread(_atomic_write_json, MISTAKES_BANK_FILE, snapshot, indent=2, ensure_ascii=False)
 
 MISTAKES_BANK: list = load_mistakes_bank()
 
@@ -2072,7 +2094,9 @@ def load_storage_index():
     return {}
 
 async def save_storage_index():
-    await asyncio.to_thread(_atomic_write_json, STORAGE_INDEX_FILE, STORAGE_INDEX, ensure_ascii=False)
+    # See save_analytics for why this snapshot copy is required.
+    snapshot = copy.deepcopy(STORAGE_INDEX)
+    await asyncio.to_thread(_atomic_write_json, STORAGE_INDEX_FILE, snapshot, ensure_ascii=False)
 
 # password (lowercased) -> list of items; each item is a list of message_ids
 # (a single-message item is [id], an album is [id1, id2, ...]). Reusing the
@@ -2100,7 +2124,10 @@ def load_storage_backup_state():
     return {}
 
 async def save_storage_backup_state():
-    await asyncio.to_thread(_atomic_write_json, STORAGE_BACKUP_STATE_FILE, STORAGE_BACKUP_STATE, ensure_ascii=False)
+    # Tiny dict, but kept consistent with every other save_* here — see
+    # save_analytics for why the snapshot copy matters.
+    snapshot = copy.deepcopy(STORAGE_BACKUP_STATE)
+    await asyncio.to_thread(_atomic_write_json, STORAGE_BACKUP_STATE_FILE, snapshot, ensure_ascii=False)
 
 STORAGE_BACKUP_STATE: dict = load_storage_backup_state()  # {"backup_msg_id": int}
 
@@ -2227,8 +2254,13 @@ def load_quiz_index(year: str) -> dict:
     return {}
 
 async def save_quiz_index(year: str):
+    # See save_analytics for why this snapshot copy is required — this is
+    # one of the highest-traffic save_* calls in the file (fires on every
+    # dead-poll cleanup during lecture delivery), so it's one of the most
+    # likely places the load test's races actually came from.
     path = QUIZ_INDEX_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_INDEX[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_INDEX[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 # year -> {lecture_name -> {"ids": [...], "closed": bool, "module": str, "subject": str, "lecture_number": str, "name": str}}
 QUIZ_INDEX: dict = {y: load_quiz_index(y) for y in YEARS}
@@ -2300,8 +2332,10 @@ def load_quiz_state(year: str) -> dict:
     return {"current_lecture": None}
 
 async def save_quiz_state(year: str):
+    # See save_analytics for why this snapshot copy is required.
     path = QUIZ_STATE_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_STATE[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_STATE[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 QUIZ_STATE: dict = {y: load_quiz_state(y) for y in YEARS}  # survives restarts mid-lecture, per year
 
@@ -2315,8 +2349,13 @@ def load_quiz_poll_status(year: str) -> dict:
     return {}
 
 async def save_quiz_poll_status(year: str):
+    # See save_analytics for why this snapshot copy is required — also
+    # high-traffic (fires on every question delivered), and this exact
+    # structure is what poll_status_by_mid is built from, read
+    # concurrently by every student's lecture session.
     path = QUIZ_POLL_STATUS_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_POLL_STATUS[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_POLL_STATUS[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 # year -> {poll_id -> {"lecture": str, "message_id": int, "closed": bool, ...}}
 # Tracks whether each quiz-channel poll has been stopped yet — Telegram
@@ -2339,8 +2378,10 @@ def load_quiz_backup_state(year: str) -> dict:
     return {}
 
 async def save_quiz_backup_state(year: str):
+    # Tiny dict, but kept consistent — see save_analytics for why.
     path = QUIZ_BACKUP_STATE_FILE_TMPL.format(year=year)
-    await asyncio.to_thread(_atomic_write_json, path, QUIZ_BACKUP_STATE[year], ensure_ascii=False)
+    snapshot = copy.deepcopy(QUIZ_BACKUP_STATE[year])
+    await asyncio.to_thread(_atomic_write_json, path, snapshot, ensure_ascii=False)
 
 QUIZ_BACKUP_STATE: dict = {y: load_quiz_backup_state(y) for y in YEARS}  # year -> {"backup_msg_id": int}
 
@@ -2496,9 +2537,17 @@ async def save_report_threads():
     # JSON object keys must be strings, so REPORT_THREADS (keyed by an
     # int message_id) needs the same str(k)/int(k) round-trip on the way
     # out and back in — see load_report_threads above.
+    #
+    # deepcopy, not just the str-keyed dict comprehension below: the
+    # comprehension only copies the OUTER dict — each thread dict (and
+    # its "messages" list) would still be the same live object the event
+    # loop can keep mutating (e.g. a reply landing) while a background
+    # thread is mid-serializing it. See save_analytics for the general
+    # explanation of why to_thread needs a frozen snapshot.
+    snapshot = {str(k): v for k, v in copy.deepcopy(REPORT_THREADS).items()}
     await asyncio.to_thread(
         _atomic_write_json, REPORT_THREADS_FILE,
-        {str(k): v for k, v in REPORT_THREADS.items()}, indent=2, ensure_ascii=False,
+        snapshot, indent=2, ensure_ascii=False,
     )
 
 REPORT_THREADS: dict = load_report_threads()   # group_message_id -> {"user_id","name","username","user_text","messages","closed"}
@@ -6870,6 +6919,33 @@ async def _post_init(app):
     the storage-group and each year's quiz-channel indexes from their
     pinned backup messages, so a wiped/switched local disk doesn't orphan
     content that's still sitting safely in the channels themselves."""
+    # asyncio.to_thread() (used by every save_*() function's disk write)
+    # runs on Python's DEFAULT ThreadPoolExecutor, sized
+    # min(32, cpu_count()+4) — on a small Railway instance (1-2 vCPUs)
+    # that's as few as 5-6 threads, shared across the ENTIRE bot. Every
+    # save_*() call (which fires on essentially every answered question —
+    # XP, streak, mistakes-bank updates) queues behind that tiny pool
+    # once concurrent students exceed it. Under load-testing (see the
+    # load-test harness from this conversation), this was the leading
+    # suspect for latency going strongly super-linear with concurrency
+    # (p95 growing ~44x for a 7x increase in users) rather than roughly
+    # linearly, since it's a real queueing bottleneck, not a CPU-bound
+    # one — these are disk-I/O-bound calls (fsync), so a pool much larger
+    # than the CPU core count is appropriate and safe, not wasteful.
+    #
+    # Done here, not at module level: this is the first point in the
+    # file guaranteed to be running ON the actual event loop PTB will use
+    # for the rest of the bot's life (_post_init is an async callback PTB
+    # itself awaits during startup, per its own post_init contract) — so
+    # asyncio.get_running_loop() here is guaranteed correct, unlike
+    # calling asyncio.get_event_loop() at bare module-import time, which
+    # can silently attach to the wrong loop object depending on Python
+    # version and how run_polling() manages its own loop internally.
+    import concurrent.futures as _cf
+    asyncio.get_running_loop().set_default_executor(
+        _cf.ThreadPoolExecutor(max_workers=64, thread_name_prefix="quizician-io")
+    )
+
     await restore_storage_from_channel(app)
     for y in configured_years():
         await restore_quiz_from_channel(app, y)
@@ -6983,6 +7059,13 @@ async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAU
 # (each user's own updates are still serialized against each other — see
 # @_serialize_per_user below); Telegram's own rate limits are still
 # enforced by AIORateLimiter regardless of how many run at once locally.
+#
+# The thread-pool-size fix for asyncio.to_thread() (every save_*()
+# function's disk write) lives in _post_init, not here — it needs a
+# guaranteed-running event loop to attach to (asyncio.get_running_loop()),
+# and at this point in the file the loop PTB will actually run polling on
+# doesn't necessarily exist yet / isn't necessarily the one
+# asyncio.get_event_loop() would return this early. See _post_init.
 app = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
