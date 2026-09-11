@@ -756,13 +756,51 @@ ANALYTICS: dict = load_analytics()
 # source of truth — no separate state file needed.
 _analytics_backup_msg_id: int | None = None
 
-# Throttle for backup_analytics_to_channel — local save_analytics() (a
-# plain JSON.dump) still happens every time and is never delayed; only the
-# channel mirror (upload + pin + delete-old-pin, three Telegram calls) gets
-# debounced, since callers like lecture-answer XP can fire dozens of times
-# a minute and would otherwise risk hitting Telegram's rate limits.
+# Throttle for backup_analytics_to_channel — the channel mirror (upload +
+# pin + delete-old-pin, three Telegram calls) gets debounced, since callers
+# like lecture-answer XP can fire dozens of times a minute and would
+# otherwise risk hitting Telegram's rate limits.
 _last_analytics_backup_at: float = 0.0
 ANALYTICS_BACKUP_MIN_INTERVAL = 300  # seconds
+
+# ── Local-disk debounce for the hot answer path ──────────────────
+# save_analytics() itself (deepcopy + atomic write of the WHOLE file, every
+# user's entry, not just the one who just answered) is still called
+# directly — and immediately — from low-frequency call sites (restore,
+# reset/import, nickname changes): those need the file on disk to be
+# correct right away and don't fire often enough for the cost to matter.
+#
+# The three poll-answer advance functions (_advance_lecture_session,
+# _advance_daily_quiz_session, _advance_mistakes_retake_session) are
+# different: they're the single hottest path in the bot, firing on every
+# answered question from every active user. Calling the real save_analytics()
+# there means every answer pays for a full-file deepcopy + fsync'd write,
+# scaling with total user count, not with "one answer." Those three now
+# call _mark_analytics_dirty() instead — an O(1) flag set, no I/O — and a
+# periodic job (_flush_analytics_job, registered in _post_init) does the
+# real save every ANALYTICS_FLUSH_INTERVAL seconds if anything changed.
+#
+# Data-loss window: a hard crash (not a clean restart/shutdown — see
+# _post_shutdown) between flushes can lose up to one interval's worth of
+# analytics deltas. 60s is deliberately much shorter than the 300s channel
+# backup already tolerates, so this isn't a new category of risk, just a
+# smaller version of one already accepted elsewhere in this file.
+_analytics_dirty: bool = False
+ANALYTICS_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_analytics_dirty() -> None:
+    global _analytics_dirty
+    _analytics_dirty = True
+
+async def _flush_analytics_if_dirty() -> None:
+    """Writes ANALYTICS to disk only if something changed since the last
+    flush. Called by the periodic job and by _post_shutdown for a final
+    flush on clean exit."""
+    global _analytics_dirty
+    if not _analytics_dirty:
+        return
+    _analytics_dirty = False
+    await save_analytics()
 
 def _today() -> str:
     from datetime import datetime, timezone
@@ -1855,7 +1893,7 @@ async def _advance_daily_quiz_session(context: ContextTypes.DEFAULT_TYPE, user_i
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    await save_analytics()
+    _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
 
@@ -2059,7 +2097,7 @@ async def _advance_mistakes_retake_session(context: ContextTypes.DEFAULT_TYPE, u
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    await save_analytics()
+    _mark_analytics_dirty()
     await _announce_events(context, user_id, events)
     await backup_analytics_to_channel(context)
 
@@ -4126,7 +4164,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     if final_level > user_entry["level"]:
         user_entry["level"] = final_level
         events["level_up"] = final_level
-    await save_analytics()
+    _mark_analytics_dirty()
     await _announce_events(context, user_id, events)   # still immediate: level-ups/achievements are rare enough to be worth a heads-up mid-lecture
 
     await backup_analytics_to_channel(context)
@@ -6857,11 +6895,12 @@ async def mystats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: wipe all analytics data locally and delete the pinned
     backup in the analytics group. Use when you need a clean slate."""
-    global _analytics_backup_msg_id
+    global _analytics_backup_msg_id, _analytics_dirty
     if update.effective_chat.id != ADMIN_ID:
         return
     ANALYTICS.clear()
     await save_analytics()
+    _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
     if _analytics_backup_msg_id and ANALYTICS_GROUP_ID:
         try:
             await context.bot.delete_message(
@@ -6894,6 +6933,7 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     when the pinned backup itself is missing/corrupted — e.g. importing a
     copy you saved elsewhere. Merges into (does not wipe) existing data,
     then re-saves and re-pins so the channel backup reflects the import."""
+    global _analytics_dirty
     if not (update.effective_user and update.effective_user.id == ADMIN_ID):
         return
     reply = update.message.reply_to_message
@@ -6914,6 +6954,7 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     ANALYTICS.update(imported)
     await save_analytics()
+    _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
     await backup_analytics_to_channel(context)
     await update.message.reply_text(
         f"✅ Imported <b>{len(imported)}</b> user(s) — merged into current data, "
@@ -6965,17 +7006,37 @@ async def _post_init(app):
 
     if app.job_queue is None:
         print(
-            "⚠️ No JobQueue available — periodic backup reconciliation and "
-            "the Daily Quiz push are disabled. Install with: "
+            "⚠️ No JobQueue available — periodic backup reconciliation, the "
+            "analytics flush, and the Daily Quiz push are disabled. Local "
+            "analytics from poll answers will only hit disk on the next "
+            "immediate-save call site (restore/reset/import) or on a clean "
+            "shutdown, not every 60s. Install with: "
             "pip install \"python-telegram-bot[job-queue]\""
         )
     else:
         app.job_queue.run_repeating(
             _reconcile_backups_job, interval=BACKUP_RECONCILE_INTERVAL, first=BACKUP_RECONCILE_INTERVAL,
         )
+        app.job_queue.run_repeating(
+            _flush_analytics_job, interval=ANALYTICS_FLUSH_INTERVAL, first=ANALYTICS_FLUSH_INTERVAL,
+        )
         app.job_queue.run_daily(
             _daily_quiz_push_job, time=dt_time(hour=DAILY_QUIZ_HOUR, minute=DAILY_QUIZ_MIN, tzinfo=DAILY_QUIZ_TZ),
         )
+
+async def _flush_analytics_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _analytics_dirty: writes analytics.json only if a poll answer marked it
+    dirty since the last tick. No-ops (no deepcopy, no I/O) on a quiet tick."""
+    await _flush_analytics_if_dirty()
+
+async def _post_shutdown(app):
+    """Runs once on a clean shutdown (PTB's own stop-signal handling calls
+    this before the process exits) — flushes any analytics still sitting in
+    memory from the last (< ANALYTICS_FLUSH_INTERVAL)-second window, so a
+    normal restart/redeploy never loses data. Only a hard crash (killed
+    process, power loss) can still lose that window; a clean stop cannot."""
+    await _flush_analytics_if_dirty()
 
 # ── Backup reconciliation ────────────────────────────────────────
 # Every backup_*_to_channel() call above is reactive and fire-and-forget:
@@ -7080,6 +7141,7 @@ app = (
     .rate_limiter(AIORateLimiter())
     .concurrent_updates(256)
     .post_init(_post_init)
+    .post_shutdown(_post_shutdown)
     .build()
 )
 
