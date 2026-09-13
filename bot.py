@@ -28,12 +28,13 @@ from zoneinfo import ZoneInfo
 #          auto_next, randomize)
 # 1114   LECTURE RESULTS — per-lecture leaderboard (own file + own
 #          backup channel: LECTURE_RESULTS_GROUP_ID)
-# 1267   MISTAKES BANK — wrong-answer pool that seeds the Daily Quiz's
-#          "questions you got wrong before" slice. Entries are lightweight
-#          {mid, year, module, subject} REFERENCES, not full question
-#          snapshots — record_mistake() stores just the id; _resolve_mistake(s)
-#          turns a reference back into a full question dict on demand via
-#          _snapshot_from_mid + QUIZ_POLL_STATUS[year].
+# 1267   MISTAKES BANK — per-user wrong-answer pool that seeds each user's
+#          own Daily Quiz "questions you got wrong before" slice. Entries
+#          are lightweight {user_id, mid, year, module, subject}
+#          REFERENCES, not full question snapshots — record_mistake()
+#          stores just the id; _resolve_mistake(s) turns a reference back
+#          into a full question dict on demand via _snapshot_from_mid +
+#          QUIZ_POLL_STATUS[year].
 #          Grep "_resolve_mistake" for every call site that needs resolved
 #          content (build_daily_quiz_questions, start_mistakes_retake).
 # 1749   MISTAKES BANK RETAKE — 🧠 Mistakes Bank menu button, one-shot
@@ -75,7 +76,7 @@ from zoneinfo import ZoneInfo
 # 3195   PASSIVE ANSWER BACKFILL / LECTURE DELIVERY + SESSION LOGIC
 #          — _deliver_next_lecture_question, _deliver_all_lecture_questions,
 #            handle_poll_answer (@_serialize_per_user), _advance_lecture_session
-#            (records mistakes into MISTAKES_BANK via record_mistake(mid, ...))
+#            (records mistakes into MISTAKES_BANK via record_mistake(user_id, mid, ...))
 # 3567   FORWARDED POLL HANDLER
 # 3606   QUESTION REVIEW / EDIT (after a question lands in the PDF buffer)
 # 3752   IMAGE HANDLER (PDF mode only)
@@ -116,7 +117,7 @@ from zoneinfo import ZoneInfo
 
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputFile
-from telegram.error import Forbidden
+from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -400,9 +401,9 @@ SETTINGS_GROUP_ID = -1004423684829
 # the bot as admin, send /storage_id inside it, paste the ID below.
 LECTURE_RESULTS_GROUP_ID = -1004292587669
 
-# ── Mistakes bank: every wrong lecture answer, pooled across all users ──
-# Feeds the "3 questions you got wrong before" slice of the Daily Quiz.
-# Given by the user directly (already an existing group/channel).
+# ── Mistakes bank: every wrong lecture answer, kept per-user ──
+# Feeds each user's own "questions you got wrong before" slice of the
+# Daily Quiz. Given by the user directly (already an existing group/channel).
 MISTAKES_BANK_GROUP_ID = -1004394139690
 
 # ── Dedicated group the bot posts crash/error reports to ────────────
@@ -416,7 +417,7 @@ ERROR_LOG_GROUP_ID = -1004333428419
 # next text message in this group becomes the reply, then the message is
 # edited to show both sides with fresh Reply/Close buttons. A plain group
 # the bot posts to — not a backup destination.
-REPORT_ISSUE_GROUP_ID = -1004495732411
+REPORT_ISSUE_GROUP_ID = -1004331095016
 
 # ── Curriculum structure for the quiz channels ─────────────────────
 # Each year in YEARS (above) has its own "modules" dict in this same shape.
@@ -564,6 +565,7 @@ USERS = load_users()
 # {
 #   "questions_created": int,
 #   "streak":            int,
+#   "streak_best":       int,
 #   "last_active_date":  "YYYY-MM-DD" | null,
 #   "pdfs_exported":     int,
 #   "lecture_questions_answered":   int,
@@ -679,6 +681,7 @@ def _blank_entry() -> dict:
     return {
         "questions_created": 0,
         "streak":            0,
+        "streak_best":       0,
         "last_active_date":  None,
         "pdfs_exported":     0,
         "lecture_questions_answered":   0,
@@ -710,7 +713,7 @@ def _is_valid_analytics_entry(e) -> bool:
         return False
     if "achievements" in e and not isinstance(e["achievements"], dict):
         return False
-    for k in ("questions_created", "streak", "pdfs_exported", "lecture_questions_answered",
+    for k in ("questions_created", "streak", "streak_best", "pdfs_exported", "lecture_questions_answered",
               "lecture_questions_correct", "lecture_questions_incorrect", "xp", "level"):
         if k in e and not isinstance(e[k], (int, float)):
             return False
@@ -725,7 +728,10 @@ def _clean_analytics_dict(raw: dict) -> dict:
     if not isinstance(raw, dict):
         print(f"ANALYTICS: top-level data wasn't a dict ({type(raw).__name__}) — ignoring entirely.")
         return {}
-    clean = {k: v for k, v in raw.items() if _is_valid_analytics_entry(v)}
+    clean = {
+        k: v for k, v in raw.items()
+        if isinstance(k, str) and k.lstrip("-").isdigit() and _is_valid_analytics_entry(v)
+    }
     if len(clean) != len(raw):
         print(f"ANALYTICS: dropped {len(raw) - len(clean)} malformed entr(y/ies).")
     return clean
@@ -810,6 +816,11 @@ def _get_entry(user_id: int) -> dict:
     key   = str(user_id)
     entry = ANALYTICS.setdefault(key, _blank_entry())
     # backfill missing keys for users created before this system
+    if "streak_best" not in entry:
+        # streak_best is new — backfill from their current streak (not 0)
+        # so an existing user with an active streak doesn't look like
+        # they've never had one; there's no historical data to do better.
+        entry["streak_best"] = entry.get("streak", 0)
     for k, v in _blank_entry().items():
         entry.setdefault(k, v)
     if not isinstance(entry.get("achievements"), dict):
@@ -828,6 +839,8 @@ def _year_leaderboard(year_class: str, limit: int = 15) -> list[dict]:
     filter, since ANALYTICS itself isn't year-scoped, SETTINGS is."""
     rows = []
     for uid_str, entry in ANALYTICS.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue   # not a real Telegram user id — corrupted/stray key, skip rather than crash
         uid = int(uid_str)
         if get_year_class(uid) != year_class:
             continue
@@ -907,6 +920,8 @@ async def _record_activity(user_id: int, questions_delta: int = 0,
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         entry["streak"] = (entry["streak"] + 1) if last == yesterday else 1
         entry["last_active_date"] = today
+        if entry["streak"] > entry.get("streak_best", 0):
+            entry["streak_best"] = entry["streak"]
 
     # ── counters ─────────────────────────────────────────────
     entry["questions_created"] += questions_delta
@@ -1110,6 +1125,11 @@ async def restore_analytics_from_channel(app):
 #                              # that need to know their class/cohort.
 #   "daily_quiz_last_date": str | None,  # "YYYY-MM-DD" — once-per-day gate for
 #                                        # the 💥Daily Quiz💥 button
+#   "language": str,  # "ar" | "en" — UI language, see get_language() /
+#                     # STRINGS / t() in the I18N section. Defaults to "ar"
+#                     # (matches the bot's current all-Arabic behavior);
+#                     # nothing reads this yet beyond the Settings toggle
+#                     # itself until strings get migrated onto t().
 # }
 #
 # Mirrors the ANALYTICS system exactly: local JSON file, plus a pinned
@@ -1142,6 +1162,7 @@ def _blank_settings_entry() -> dict:
                                 # auto-closing; 0 = off. Cycles 0 -> 60 -> 30 -> 0.
         "year_class": None,    # "y1"/"y2"/"y3" — see YEAR_CLASS_NUMBER above
         "daily_quiz_last_date": None,   # "YYYY-MM-DD" (UTC) of the last completed Daily Quiz
+        "language": "ar",      # "ar" | "en" — see get_language() / I18N section
     }
 
 def load_settings() -> dict:
@@ -1213,6 +1234,62 @@ def year_class_label(year_class: str | None) -> str:
     if year_class not in YEAR_CLASS_NUMBER:
         return "لسه محدد"
     return f"{year_label(year_class)} (Class {YEAR_CLASS_NUMBER[year_class]})"
+
+SUPPORTED_LANGUAGES = ("ar", "en")
+
+def get_language(user_id: int) -> str:
+    # Defaults to "ar" for anyone not yet in SETTINGS (or missing the
+    # key) — matches _blank_settings_entry()'s default and the bot's
+    # current all-Arabic behavior, so nobody's language silently changes
+    # just because this field is new.
+    return SETTINGS.get(str(user_id), {}).get("language", "ar")
+
+# ═══════════════════════════════════════════════════════════════
+# I18N — bilingual string lookup (infrastructure only for now)
+#
+# The bot's ~350 user-facing messages are still hardcoded Arabic
+# throughout the handlers below — this section is just the scaffolding
+# (the setting, the toggle, and the lookup helper) for migrating them
+# onto STRINGS/t() gradually, one message at a time, rather than a
+# single big-bang rewrite. Nothing is translated yet.
+#
+# To migrate a message:
+#   1. Add a key to STRINGS below, e.g.:
+#        "mystats_no_data": {
+#            "ar": "📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!",
+#            "en": "📊 No stats yet. Send some questions and they'll show up here!",
+#        },
+#   2. Replace the hardcoded literal at its call site with
+#        t("mystats_no_data", user_id)
+#      — or t("key", user_id, name=x) if the original string had an
+#      f-string value baked in; use {name} inside the STRINGS text and
+#      pass name=x as a kwarg, the same way str.format works.
+#
+# Deliberately ONE shared dict (not one file per language) — see the
+# /report_issue-adjacent conversation this came out of: two files means
+# two things to keep in sync by hand, and it's easy for one language to
+# quietly fall behind. Keeping ar/en side by side per key makes a
+# missing translation obvious at a glance instead of a silent gap in a
+# second file nobody's looking at.
+STRINGS: dict[str, dict[str, str]] = {
+    # populated incrementally as messages get migrated — see the how-to above
+}
+
+def t(key: str, user_id: int, **kwargs) -> str:
+    """Looks up STRINGS[key] for this user's language (get_language) and
+    fills in any {placeholder} kwargs, the same way str.format works.
+    Falls back to Arabic if this key hasn't been given an "en" entry yet
+    (so migrating one string at a time never breaks anything for users
+    who've already switched to English), and falls back to a visibly
+    broken placeholder — not a crash, not a silent blank — if the key
+    doesn't exist in STRINGS at all, so a typo'd key is obvious in the
+    chat immediately instead of quietly showing nothing."""
+    lang  = get_language(user_id)
+    entry = STRINGS.get(key)
+    if not entry:
+        return f"[[missing string: {key}]]"
+    text = entry.get(lang) or entry.get("ar") or f"[[missing string: {key}]]"
+    return text.format(**kwargs) if kwargs else text
 
 def year_class_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
     """The Year 1/2/3 (Class 46/45/44) picker, reused for both onboarding
@@ -1364,6 +1441,8 @@ def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
     results = _get_lecture_results(lecture_key)
     rows = []
     for uid_str, r in results.items():
+        if not (isinstance(uid_str, str) and uid_str.lstrip("-").isdigit()):
+            continue   # not a real Telegram user id — corrupted/stray key, skip rather than crash
         uid = int(uid_str)
         rows.append({
             "user_id":  uid,
@@ -1429,13 +1508,13 @@ async def restore_lecture_results_from_channel(app):
     await _run_restore_with_retries(app, "lecture_results", "Lecture results", _do)
 
 # ═══════════════════════════════════════════════════════════════
-# MISTAKES BANK — every lecture question anyone's ever gotten wrong,
-# pooled across all users/years/subjects, used to seed the "3 questions
-# you got wrong before" slice of the Daily Quiz (see DAILY QUIZ section).
+# MISTAKES BANK — every lecture question a user's gotten wrong, kept
+# per-user, used to seed the "questions you got wrong before" slice of the
+# Daily Quiz (see DAILY QUIZ section).
 #
 # mistakes_bank.json schema:
 # [
-#   {"mid": int, "year": str, "module": str, "subject": str},
+#   {"user_id": int, "mid": int, "year": str, "module": str, "subject": str},
 #   ...
 # ]
 #
@@ -1465,29 +1544,28 @@ MISTAKES_BANK_BACKUP_MARKER = "🗑 QUIZICIAN_MISTAKES_BANK_BACKUP"
 
 def load_mistakes_bank() -> list:
     """Loads the local mistakes-bank file, dropping (and logging) any
-    entry missing a required key. Malformed entries have shown up here at
-    least once in practice (a KeyError on "mid" reaching all the way into
-    the Daily Quiz build) — root cause unconfirmed (a hand-edited file, an
-    old bot version's different shape, or a channel-backup restore
-    predating some schema change are all possible), but every entry this
-    system ever writes itself (see record_mistake) always has all four
-    keys, so anything missing one didn't come from normal operation and
-    isn't safe to trust downstream. Filtering here means every reader
-    (record_mistake's dedup check, _scoped_mistakes_bank, _resolve_mistake)
-    can keep assuming a well-formed entry without each needing its own
-    defensive check."""
+    entry missing a required key — including "user_id", added when the
+    bank became per-user; older entries recorded before that change don't
+    have it and are intentionally discarded here rather than migrated, per
+    an explicit decision to start every user's bank fresh instead of
+    guessing at ownership. Every entry this system writes itself (see
+    record_mistake) always has all five keys, so anything missing one
+    didn't come from normal operation and isn't safe to trust downstream.
+    Filtering here means every reader (record_mistake's dedup check,
+    _scoped_mistakes_bank, _resolve_mistake) can keep assuming a
+    well-formed entry without each needing its own defensive check."""
     if not os.path.exists(MISTAKES_BANK_FILE):
         return []
     with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
         raw = json.load(f)
-    required = ("mid", "year", "module", "subject")
+    required = ("user_id", "mid", "year", "module", "subject")
     clean  = [m for m in raw if isinstance(m, dict) and all(k in m for k in required)]
     if len(clean) != len(raw):
-        print(f"MISTAKES BANK: dropped {len(raw) - len(clean)} malformed entr(y/ies) missing a required key on load.")
+        print(f"MISTAKES BANK: dropped {len(raw) - len(clean)} malformed/legacy entr(y/ies) missing a required key on load.")
     return clean
 
 def _is_valid_mistake_entry(m) -> bool:
-    return isinstance(m, dict) and all(k in m for k in ("mid", "year", "module", "subject"))
+    return isinstance(m, dict) and all(k in m for k in ("user_id", "mid", "year", "module", "subject"))
 
 async def save_mistakes_bank():
     # See save_analytics for why this snapshot copy is required — this is
@@ -1501,6 +1579,42 @@ async def save_mistakes_bank():
 
 MISTAKES_BANK: list = load_mistakes_bank()
 
+# ── Per-user index over MISTAKES_BANK ───────────────────────────
+# MISTAKES_BANK is one flat list holding every user's entries (see
+# schema note above), which made every read of "this user's mistakes"
+# a full scan of the whole bank — fine at hundreds of entries, but a
+# scan that grows with EVERY user's activity just to answer a question
+# about ONE user doesn't scale as the bank grows. _MISTAKES_BY_USER
+# keeps the same entry dicts (not copies) grouped by user_id, so a
+# lookup is O(this user's mistakes) instead of O(everyone's). It's a
+# derived structure, not a second source of truth — MISTAKES_BANK stays
+# the one thing that gets saved/backed up; this index is rebuilt or
+# patched to match it at every mutation site (grep _reindex_mistakes,
+# _mistakes_index_add, _mistakes_index_remove to find all of them).
+_MISTAKES_BY_USER: dict[int, list] = {}
+
+def _reindex_mistakes_bank() -> None:
+    """Rebuilds _MISTAKES_BY_USER from scratch against the current
+    MISTAKES_BANK. Call this after any bulk replacement of the bank's
+    contents (initial load, a channel restore) — for the routine
+    single-entry cases (one mistake recorded, one stale entry pruned)
+    use _mistakes_index_add / _mistakes_index_remove instead, which
+    update the index in O(1) rather than rescanning everything."""
+    _MISTAKES_BY_USER.clear()
+    for m in MISTAKES_BANK:
+        if _is_valid_mistake_entry(m):
+            _MISTAKES_BY_USER.setdefault(m["user_id"], []).append(m)
+
+def _mistakes_index_add(entry: dict) -> None:
+    _MISTAKES_BY_USER.setdefault(entry["user_id"], []).append(entry)
+
+def _mistakes_index_remove(entry: dict) -> None:
+    bucket = _MISTAKES_BY_USER.get(entry.get("user_id"))
+    if bucket and entry in bucket:
+        bucket.remove(entry)
+
+_reindex_mistakes_bank()
+
 # Message ID of the currently pinned mistakes-bank backup in
 # MISTAKES_BANK_GROUP_ID. Populated on startup by
 # restore_mistakes_bank_from_channel; the pin is the source of truth.
@@ -1511,17 +1625,20 @@ _mistakes_bank_backup_msg_id: int | None = None
 _last_mistakes_bank_backup_at: float = 0.0
 MISTAKES_BANK_BACKUP_MIN_INTERVAL = 300  # seconds
 
-async def record_mistake(mid: int, year: str, module: str, subject: str) -> bool:
+async def record_mistake(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
     """Adds a wrong-answer REFERENCE to the bank — just the question id
     (mid) + scoping info, not the full question text (see schema note
-    above). Deduped by (year, mid), so the same question missed by 50
-    different people over time only ever occupies one slot. Returns
-    whether a new entry was added (False if it was already there —
-    nothing to save/back up in that case)."""
-    for m in MISTAKES_BANK:
-        if _is_valid_mistake_entry(m) and m["mid"] == mid and m["year"] == year:
+    above). Deduped by (user_id, year, mid), so the same question missed
+    twice by the same person only ever occupies one slot — but different
+    people missing the same question each get their own entry, since the
+    bank is per-user. Returns whether a new entry was added (False if it
+    was already there — nothing to save/back up in that case)."""
+    for m in _MISTAKES_BY_USER.get(user_id, []):
+        if m["mid"] == mid and m["year"] == year:
             return False
-    MISTAKES_BANK.append({"mid": mid, "year": year, "module": module, "subject": subject})
+    entry = {"user_id": user_id, "mid": mid, "year": year, "module": module, "subject": subject}
+    MISTAKES_BANK.append(entry)
+    _mistakes_index_add(entry)
     await save_mistakes_bank()
     return True
 
@@ -1578,6 +1695,7 @@ async def restore_mistakes_bank_from_channel(app):
         if len(clean) != len(restored):
             print(f"MISTAKES BANK: dropped {len(restored) - len(clean)} malformed entr(y/ies) from the channel backup on restore.")
         MISTAKES_BANK[:] = clean
+        _reindex_mistakes_bank()
         await save_mistakes_bank()
         _mistakes_bank_backup_msg_id = pinned.message_id
         print(f"Restored mistakes bank: {len(MISTAKES_BANK)} question(s).")
@@ -1585,12 +1703,13 @@ async def restore_mistakes_bank_from_channel(app):
     await _run_restore_with_retries(app, "mistakes_bank", "Mistakes bank", _do)
 
 # ═══════════════════════════════════════════════════════════════
-# DAILY QUIZ — 💥Daily Quiz💥: 7 random questions pulled from random
-# subjects (any subject can contribute more than one — this is not a
-# one-per-subject pick), plus 3 random questions from the shared
-# MISTAKES_BANK. Both slices are restricted to the admin-set /daily_module
-# scope when one is set (see get_daily_quiz_scope), or span every
-# configured year/module otherwise. Pushed to everyone at 2pm Cairo time
+# DAILY QUIZ — 💥Daily Quiz💥: 10 questions total — up to 3 pulled from the
+# user's own MISTAKES_BANK entries, topped up with random questions from
+# random subjects (any subject can contribute more than one — this is not
+# a one-per-subject pick) so the run is always 10 long even when the
+# user's mistakes bank is empty or short. Both slices are restricted to the
+# admin-set /daily_module scope when one is set (see get_daily_quiz_scope),
+# or span every configured year/module otherwise. Pushed to everyone at 2pm Cairo time
 # once a day (see the job_queue.run_daily call in MAIN); the push itself
 # is just a button — tapping it is what actually starts the quiz and is
 # gated to once per person per day via each user's settings
@@ -1609,8 +1728,10 @@ DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current
                            #             "current_correct_id", "current_message_id",
                            #             "total", "answered", "correct", "xp_earned"}
 
-DAILY_QUIZ_SUBJECT_COUNT  = 7   # random questions from the ready-question pool
-DAILY_QUIZ_MISTAKES_COUNT = 3   # random questions pulled from the mistakes bank
+DAILY_QUIZ_TOTAL_COUNT    = 10  # total questions in one Daily Quiz run — always
+                                 # topped up from the random pool so a run is
+                                 # this long even when the mistakes bank is empty
+DAILY_QUIZ_MISTAKES_COUNT = 3   # cap on how many of those can come from the mistakes bank
 
 # Push time for the daily 💥Daily Quiz💥 button (see job_queue.run_daily in
 # MAIN, and next_daily_quiz_time() / /time below — all three read from
@@ -1705,17 +1826,24 @@ async def _snapshot_from_mid(context: ContextTypes.DEFAULT_TYPE, year: str, mid:
         "explanation": explanation, "year": year, "module": module, "subject": subject,
     }
 
-def _scoped_mistakes_bank() -> list:
-    """MISTAKES_BANK filtered to the admin-set /daily_module scope, if
-    any. Unlike the subject pool (which is scoped by construction), this
-    filters the flat list directly since MISTAKES_BANK isn't grouped by
-    (year, module) already. Returns lightweight {mid, year, module,
-    subject} references — see _resolve_mistake(s) to turn these into full
-    question dicts."""
+def _scoped_mistakes_bank(user_id: int) -> list:
+    """This user's slice of MISTAKES_BANK (via _MISTAKES_BY_USER — see
+    its comment for why), further filtered to the admin-set
+    /daily_module scope, if any. Returns lightweight {user_id, mid,
+    year, module, subject} references — see _resolve_mistake(s) to turn
+    these into full question dicts."""
     scope = get_daily_quiz_scope()
+    user_entries = _MISTAKES_BY_USER.get(user_id, [])
     if not scope:
-        return MISTAKES_BANK
-    return [m for m in MISTAKES_BANK if _is_valid_mistake_entry(m) and m["year"] == scope["year"] and m["module"] == scope["module"]]
+        return list(user_entries)
+    return [m for m in user_entries if m["year"] == scope["year"] and m["module"] == scope["module"]]
+
+def _user_mistake_count(user_id: int) -> int:
+    """This user's total mistake-bank entries, ignoring any admin-set
+    /daily_module scope — for personal displays like /mystats, where the
+    admin's narrowing of the Daily Quiz shouldn't make the user's own
+    bank look smaller than it really is."""
+    return len(_MISTAKES_BY_USER.get(user_id, []))
 
 def _poll_status_index(year: str) -> dict:
     """{message_id: status} for every poll tracked in QUIZ_POLL_STATUS[year].
@@ -1746,6 +1874,7 @@ async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, stat
         print(f"MISTAKES BANK: skipping and removing malformed entry: {entry!r}")
         try:
             MISTAKES_BANK.remove(entry)
+            _mistakes_index_remove(entry)
             await save_mistakes_bank()
         except ValueError:
             pass
@@ -1754,6 +1883,7 @@ async def _resolve_mistake(context: ContextTypes.DEFAULT_TYPE, entry: dict, stat
     if snap is None:
         try:
             MISTAKES_BANK.remove(entry)
+            _mistakes_index_remove(entry)
             await save_mistakes_bank()
         except ValueError:
             pass   # already removed by a concurrent lookup — harmless
@@ -1778,18 +1908,29 @@ async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -
             resolved.append(snap)
     return resolved
 
-async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE) -> list:
-    """The full 10-question set for one Daily Quiz run: 7 random questions
-    pulled from random subjects (a subject can contribute more than one —
-    this is NOT one-per-subject) plus up to 3 from the mistakes bank.
-    Both slices respect the admin-set /daily_module scope, if any. Falls
-    short of 10 gracefully if there isn't enough ready content yet —
-    callers just get a shorter (or empty) list."""
+async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list:
+    """The full DAILY_QUIZ_TOTAL_COUNT-question set for one Daily Quiz run:
+    up to DAILY_QUIZ_MISTAKES_COUNT from this user's own mistakes bank,
+    then topped up with random questions pulled from random subjects (a
+    subject can contribute more than one — this is NOT one-per-subject) so
+    the run is always DAILY_QUIZ_TOTAL_COUNT questions long — even when
+    this user's mistakes bank is empty or short, the random pool fills the
+    rest. Both slices respect the admin-set /daily_module scope, if any.
+    Falls short of DAILY_QUIZ_TOTAL_COUNT gracefully if there isn't enough
+    ready random content yet — callers just get a shorter (or empty)
+    list."""
+    mistakes = _scoped_mistakes_bank(user_id)
+    mistake_sample = random.sample(mistakes, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(mistakes))) if mistakes else []
+    questions = await _resolve_mistakes(context, mistake_sample) if mistake_sample else []
+
+    # Whatever the mistakes bank didn't cover (including all of it, when
+    # empty) gets filled from the random pool below, so the total is always
+    # DAILY_QUIZ_TOTAL_COUNT rather than a fixed random count + leftover mistakes.
     subject_pool = _daily_quiz_subject_pool()
     # Flatten to one (year, module, subject, mid) tuple per ready question,
-    # so picking 7 is a plain random sample over individual questions —
-    # not a pick-a-subject-then-one-question-from-it scheme, which is what
-    # was capping this to one question per subject before.
+    # so picking random_needed is a plain random sample over individual
+    # questions — not a pick-a-subject-then-one-question-from-it scheme,
+    # which is what was capping this to one question per subject before.
     all_mids = [
         (year, module, subject, mid)
         for (year, module, subject), mids in subject_pool.items()
@@ -1799,23 +1940,17 @@ async def build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE) -> list
 
     # One poll-status index per distinct year touched, built once here
     # rather than _snapshot_from_mid scanning QUIZ_POLL_STATUS[year] fresh
-    # for every one of up to DAILY_QUIZ_SUBJECT_COUNT questions.
+    # for every one of up to random_needed questions.
     status_by_mid_by_year: dict = {}
 
-    questions = []
     for year, module, subject, mid in all_mids:
-        if len(questions) >= DAILY_QUIZ_SUBJECT_COUNT:
+        if len(questions) >= DAILY_QUIZ_TOTAL_COUNT:
             break
         if year not in status_by_mid_by_year:
             status_by_mid_by_year[year] = _poll_status_index(year)
         snap = await _snapshot_from_mid(context, year, mid, module, subject, status_by_mid_by_year[year])
         if snap:
             questions.append(snap)
-
-    mistakes = _scoped_mistakes_bank()
-    if mistakes:
-        sample = random.sample(mistakes, k=min(DAILY_QUIZ_MISTAKES_COUNT, len(mistakes)))
-        questions.extend(await _resolve_mistakes(context, sample))
 
     random.shuffle(questions)
     return questions
@@ -1926,7 +2061,7 @@ def get_daily_quiz_last_date(user_id: int) -> str | None:
     return SETTINGS.get(str(user_id), {}).get("daily_quiz_last_date")
 
 # ── Admin-set Daily Quiz scope ──────────────────────────────────
-# By default both the 7-random-questions slice and the 3-mistakes-bank
+# By default both the random-questions slice and the mistakes-bank
 # slice draw from every configured year/module. An admin can narrow both
 # to one specific module (e.g. whatever's currently being taught) via
 # /daily_module — see _daily_quiz_subject_pool and _scoped_mistakes_bank.
@@ -1956,16 +2091,16 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     only gets today's quiz once."""
     today = _today()
     if get_daily_quiz_last_date(user_id) == today:
-        text = f"⏳ خلصت الـ Daily Quiz بتاعت النهاردة خلاص!\n\n{_next_daily_quiz_line()}"
+        text = f" !خلصت الكويز اليومي بتاع النهاردة خلاص\n\n{_next_daily_quiz_line()}"
         if message:
             await message.edit_text(text)
         else:
             await context.bot.send_message(chat_id=user_id, text=text)
         return
 
-    questions = await build_daily_quiz_questions(context)
+    questions = await build_daily_quiz_questions(context, user_id)
     if not questions:
-        text = "📭 مفيش أسئلة كفاية جاهزة لعمل Daily Quiz دلوقتي — جرب تاني قريب."
+        text = "check again later :/"
         if message:
             await message.edit_text(text)
         else:
@@ -1983,7 +2118,7 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
     }
     DAILY_QUIZ_SESSIONS[user_id] = session
 
-    text = f"💥 <b>Daily Quiz</b> — {len(questions)} سؤال من مواد مختلفة، هيتبعتولك واحد واحد 👇"
+    text = f"💥 <b>Daily Quiz</b> — {len(questions)} أس~لة من مواد مختلفة 👇"
     if message:
         await message.edit_text(text, parse_mode=ParseMode.HTML)
     else:
@@ -2002,7 +2137,7 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=uid,
-                text="💥 <b>Daily Quiz</b> جاهزة! جرب 10 أسئلة سريعة.",
+                text="💥 <b>Daily Quiz</b> !الكويز اليومي أتجدد",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("💥Daily Quiz💥", callback_data="daily_quiz"),
@@ -2023,14 +2158,15 @@ async def _daily_quiz_push_job(context: ContextTypes.DEFAULT_TYPE):
 MISTAKES_RETAKE_SESSIONS = {}   # user_id -> same session shape as DAILY_QUIZ_SESSIONS
 
 async def start_mistakes_retake(context: ContextTypes.DEFAULT_TYPE, user_id: int, message=None) -> None:
-    """Every question currently in the mistakes bank for the admin-set
-    /daily_module scope (or the whole bank if no scope is set), sent one
-    at a time. No once-per-day gate — unlike the Daily Quiz, this is an
-    on-demand review the user can retake as often as they like."""
-    entries   = list(_scoped_mistakes_bank())
+    """Every question currently in this user's mistakes bank, restricted to
+    the admin-set /daily_module scope (or the whole bank if no scope is
+    set), sent one at a time. No once-per-day gate — unlike the Daily
+    Quiz, this is an on-demand review the user can retake as often as they
+    like."""
+    entries   = list(_scoped_mistakes_bank(user_id))
     questions = await _resolve_mistakes(context, entries) if entries else []
     if not questions:
-        text = "🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
+        text = "أما أنت كينج صحيح - 🎉 مفيش أخطاء متسجلة في بنك الأخطاء دلوقتي!"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]])
         if message:
             await message.edit_text(text, reply_markup=keyboard)
@@ -2668,7 +2804,7 @@ async def restore_report_threads_from_channel(app):
 # ═══════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════
-MAX_QUESTIONS_PER_MSG = 40
+MAX_QUESTIONS_PER_MSG = 50
 TELEGRAM_Q_LIMIT      = 300   # max chars in poll question field
 TELEGRAM_DESC_LIMIT   = 200   # max chars in poll description (shown above question)
 TELEGRAM_EX_LIMIT     = 200   # max chars in poll explanation (shown after answering)
@@ -2725,6 +2861,18 @@ def clean_option(line: str) -> str:
 
 def strip_leading_letter_prefix(option: str) -> str:
     return re.sub(r"^[A-Ea-e]\)\s*", "", option).strip()
+
+_MCQ_OPTION_PREFIX_RE = re.compile(r"^[A-Ea-e1-5][).\-]\s*")
+
+def _looks_like_mcq_attempt(lines: list) -> bool:
+    """True if at least one line looks like someone attempting an MCQ
+    option (starts with a "a)"/"b)"/"1." style prefix — same pattern
+    clean_option() strips), even though the block as a whole fell short
+    of the 3+ lines normalize_mcq_block needs to treat it as a real
+    question. Used to tell an ordinary chat message ("مساء الخير", "شكرا")
+    apart from a genuine-but-broken question attempt — only the second
+    case gets the "wrong format!" warning; see its call site."""
+    return any(_MCQ_OPTION_PREFIX_RE.match(l) for l in lines)
 
 def normalize_mcq_block(block: str):
     block = block.strip()
@@ -3129,17 +3277,22 @@ def settings_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     timer      = get_question_timer_seconds(user_id)
     timer_tag  = "🔴 Off" if timer == 0 else f"🟢 {timer}s"
     yc_label   = year_class_label(get_year_class(user_id))
-    return InlineKeyboardMarkup([
+    lang       = get_language(user_id)
+    lang_tag   = "English" if lang == "en" else "العربية"
+    rows = [
         [InlineKeyboardButton("✏️ Edit Nickname", callback_data="edit_nickname")],
         [InlineKeyboardButton(f"📚 Year/Class: {yc_label}", callback_data="edit_year_class")],
+        [InlineKeyboardButton(f"🌐 Language: {lang_tag}", callback_data="toggle_language")],
         [InlineKeyboardButton(f"🎭 Reactions: {_tag(reactions)}", callback_data="toggle_reactions")],
         [InlineKeyboardButton(f"⏭️ Auto-Next: {_tag(auto_next)}", callback_data="toggle_auto_next")],
         [InlineKeyboardButton(f"🔀 Randomize: {_tag(randomize)}", callback_data="toggle_randomize")],
         [InlineKeyboardButton(f"🏆 Achievement Alerts: {_tag(ach_notifs)}", callback_data="toggle_achievement_notifs")],
         [InlineKeyboardButton(f"🔁 Spaced Repetition: {_tag(spaced_rep)}", callback_data="toggle_spaced_repetition")],
         [InlineKeyboardButton(f"⏱️ Question Timer: {timer_tag}", callback_data="toggle_question_timer")],
+        [InlineKeyboardButton("🗑 Clear Mistake Bank", callback_data="clear_mistakes_bank_ask")],
         [InlineKeyboardButton("🏠 Back to Home",  callback_data="back_home")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 # ═══════════════════════════════════════════════════════════════
 # MENU TEXT CONTENT
@@ -4097,7 +4250,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
     session["correct"] = session.get("correct", 0) + (1 if is_correct else 0)
     if not is_correct and mid is not None:
         session.setdefault("wrong_mids", []).append(mid)
-        # Also pool this question into the cross-user mistakes bank, for
+        # Also pool this question into the user's own mistakes bank, for
         # the Daily Quiz's "questions you got wrong before" slice. Only
         # store the question id (mid) here, not the full text — full
         # content is resolved on demand later via _resolve_mistake, which
@@ -4111,7 +4264,7 @@ async def _advance_lecture_session(context: ContextTypes.DEFAULT_TYPE, user_id: 
         year   = session["year"]
         status = session.get("poll_status_by_mid", {}).get(mid)
         if status and status.get("question") and status.get("options") and status.get("correct_option_id") is not None:
-            if await record_mistake(mid, year, session["module"], session["subject"]):
+            if await record_mistake(user_id, mid, year, session["module"], session["subject"]):
                 await backup_mistakes_bank_to_channel(context)
 
     if session.get("mode") == "batch":
@@ -4815,7 +4968,7 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_module_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: pick a year, then a module, to restrict BOTH the Daily
-    Quiz's 7-random-questions slice and its 3-mistakes-bank slice to just
+    Quiz's random-questions slice and its mistakes-bank slice to just
     that module (e.g. whatever's currently being taught) instead of the
     whole curriculum. Own callback_data namespace (dqy:/dqm:/dq_scope_off)
     — deliberately separate from the yr:/module: user-facing browsing
@@ -5283,7 +5436,14 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ── MCQ ─────────────────────────────────────────────
             lines = normalize_mcq_block(block)
             if len(lines) < 3:
-                if not in_pdf_mode:
+                # Only warn if this looks like a genuine (but broken)
+                # attempt at a question — i.e. it has at least one
+                # option-style line (a)/b)/1. ...). Plain chat text never
+                # matches that, so "hi"/"شكرا"/etc. pass through silently
+                # instead of getting flagged as a format error, while
+                # someone who typed a)/b)/c) but got the shape wrong
+                # still gets pointed at the right format.
+                if not in_pdf_mode and _looks_like_mcq_attempt(lines):
                     await update.message.reply_text(
                         "⚠️ <b>الصياغة غلط!</b>\n\n"
                         "الشكل الصح هو:\n"
@@ -5696,8 +5856,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    f"⚠️ {not_ready_cnt} سؤال لسه مش جاهز (التصويت عليه لسه مفتوح في القناة) "
-                    "— هيتبعت لما الأدمن يوقفه."
+                    f"⚠️ {not_ready_cnt} Quiz not ready yet"
+                    "use /report_issue للتواصل مع أدمن"
                 ),
             )
         return
@@ -5799,7 +5959,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "edit_pick":
         items = PDF_BUFFER.get(user_id, [])
         if not items:
-            await query.answer("مفيش أسئلة في البافر دلوقتي", show_alert=True)
+            await query.answer("مفيش أسئلة دلوقتي", show_alert=True)
             return
         lines = ["✏️ <b>اختار رقم السؤال اللي عايز تعدله:</b>\n"]
         for i, item in enumerate(items):
@@ -6083,6 +6243,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_settings(context, user_id, query.message, edit=True)
         return
 
+    if query.data == "toggle_language":
+        # 2-way cycle: ar -> en -> ar. Only flips the stored preference —
+        # see the I18N section for how (and how little, so far) anything
+        # actually reads it yet.
+        entry = _get_settings_entry(user_id)
+        current = entry.get("language", "ar")
+        entry["language"] = "en" if current == "ar" else "ar"
+        await save_settings()
+        await backup_settings_to_channel(context)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
+    # ── Settings: Clear Mistake Bank (with confirmation) ──
+    # MISTAKES_BANK holds every user's entries in one file, but each entry
+    # is tagged with its owner (see MISTAKES BANK schema note), so this
+    # action only ever touches the tapping user's own entries — and
+    # asks for an explicit tap-to-confirm before wiping them, since it's
+    # destructive.
+    if query.data == "clear_mistakes_bank_ask":
+        count = len(_scoped_mistakes_bank(user_id))
+        if not count:
+            await query.answer("🎉 بنك الأخطاء بتاعك فاضي أصلاً!", show_alert=True)
+            return
+        await query.edit_message_text(
+            f"⚠️ <b>متأكد إنك عايز تمسح بنك الأخطاء بتاعك؟</b>\n\n"
+            f"هيتمسح <b>{count}</b> سؤال، والعملية دي مش هترجع تاني.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 أيوه، امسح", callback_data="clear_mistakes_bank_yes")],
+                [InlineKeyboardButton("🔙 لأ، رجّعني", callback_data="menu_settings")],
+            ]),
+        )
+        return
+
+    if query.data == "clear_mistakes_bank_yes":
+        # Remove only this user's entries (identity, not just count, so the
+        # removal is exact even if the bank changed between the confirm
+        # screen and this tap).
+        before  = len(MISTAKES_BANK)
+        MISTAKES_BANK[:] = [m for m in MISTAKES_BANK if not (_is_valid_mistake_entry(m) and m["user_id"] == user_id)]
+        cleared = before - len(MISTAKES_BANK)
+        _MISTAKES_BY_USER.pop(user_id, None)   # O(1) — we know exactly whose bucket emptied
+        await save_mistakes_bank()
+        await backup_mistakes_bank_to_channel(context)
+        await query.answer(f"✅ اتمسح {cleared} سؤال من بنك الأخطاء بتاعك.", show_alert=True)
+        await _send_settings(context, user_id, query.message, edit=True)
+        return
+
     if query.data == "menu_quizzes":
         # Same as typing /quiz — sends a fresh message (not an edit) so the
         # welcome message with its buttons stays intact above it.
@@ -6104,7 +6312,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── 🧠 Mistakes Bank menu button ──────────────────────────────
     if query.data == "mistakes_bank_menu":
         scope = get_daily_quiz_scope()
-        count = len(_scoped_mistakes_bank())
+        count = len(_scoped_mistakes_bank(user_id))
         scope_line = f"📚 {year_label(scope['year'])} — {module_label(scope['module'])}\n\n" if scope else ""
         text = f"🧠 <b>بنك الأخطاء</b>\n\n{scope_line}عدد الأسئلة المسجلة: <b>{count}</b>"
         buttons = []
@@ -6801,7 +7009,7 @@ async def _send_achievements(context: ContextTypes.DEFAULT_TYPE, user_id: int, r
     await send("\n".join(lines).strip(), parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_target, edit: bool = False) -> None:
-    """Builds and sends the /mystats report to reply_target (an
+    """Builds and sends the /mystats profile card to reply_target (an
     update.message or a callback_query.message — both support
     reply_text/edit_text). Shared by the /mystats command and the
     main-menu button. edit=True rewrites reply_target in place instead of
@@ -6813,24 +7021,32 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         await send("📊 لسه معندكش إحصائيات. ابعت أسئلة وهتظهر هنا!")
         return
 
-    streak  = entry.get("streak", 0)
-    total_q = entry.get("questions_created", 0)
-    pdfs    = entry.get("pdfs_exported", 0)
-    lec_answered  = entry.get("lecture_questions_answered", 0)
-    lec_correct   = entry.get("lecture_questions_correct", 0)
-    lec_incorrect = entry.get("lecture_questions_incorrect", 0)
-    lec_best_streak = entry.get("lecture_correct_streak_best", 0)
-    last    = entry.get("last_active_date", "—")
-    xp      = entry.get("xp", 0)
-    level   = entry.get("level", 0)
-    title   = _level_title(level)
-    flame   = "🔥" * min(streak, 5) if streak else "❄️"
+    streak      = entry.get("streak", 0)
+    # streak_best is new — fall back to streak itself for an entry that
+    # predates it and hasn't gone through _get_entry's backfill yet (e.g.
+    # right after a restore, before this user's first action this run).
+    streak_best = entry.get("streak_best", streak)
+    lec_answered = entry.get("lecture_questions_answered", 0)
+    lec_correct  = entry.get("lecture_questions_correct", 0)
+    accuracy     = (lec_correct / lec_answered * 100) if lec_answered else 0.0
+    xp    = entry.get("xp", 0)
+    level = entry.get("level", 0)
+    title = _level_title(level)
 
     xp_start, xp_end = _level_xp_range(level)
     xp_into_level    = xp - xp_start
     xp_needed        = xp_end - xp_start
     bar_filled       = int((xp_into_level / xp_needed) * 10) if xp_needed else 10
     bar              = "█" * bar_filled + "░" * (10 - bar_filled)
+
+    nickname = get_nickname(user_id) or "—"
+    year_class = get_year_class(user_id)
+    year_line = (
+        f"{year_class[1:]} (Class {YEAR_CLASS_NUMBER[year_class]})"
+        if year_class in YEAR_CLASS_NUMBER else "—"
+    )
+
+    mistake_count = _user_mistake_count(user_id)
 
     # achievements summary
     ach        = entry.get("achievements", {})
@@ -6839,7 +7055,6 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
         "questions": "❓", "streak": "🔥", "pdfs": "📚", "speed": "⚡",
         "lecture_questions": "🎓", "lecture_streak": "🎯",
     }
-    tier_names = ["", "I", "II", "III", "IV", "V"]
     for key, emoji in icons.items():
         tier = ach.get(key, 0)
         if tier:
@@ -6850,16 +7065,23 @@ async def _send_mystats(context: ContextTypes.DEFAULT_TYPE, user_id: int, reply_
 
     send = reply_target.edit_text if edit else reply_target.reply_text
     await send(
-        f"📊 <b>إحصائياتك</b>\n\n"
-        f"🏅 المستوى: <b>{level}</b> — <i>{title}</i>\n"
-        f"✨ XP: <b>{xp}</b>  [{bar}]  → {xp_end}\n\n"
-        f"❓ أسئلة أنشأتها: <b>{total_q}</b>\n"
-        f"📚 PDFs: <b>{pdfs}</b>\n"
-        f"🎓 أسئلة محاضرات جاوبتها: <b>{lec_answered}</b> (✅ {lec_correct} / ❌ {lec_incorrect})\n"
-        f"🎯 أعلى سلسلة إجابات صح: <b>{lec_best_streak}</b>\n"
-        f"🗓 سلسلة الأيام: <b>{streak}</b> {flame}\n"
-        f"📅 آخر نشاط: <b>{last}</b>\n\n"
-        f"🏆 <b>إنجازات:</b>\n{ach_text}",
+        f"╔══════════════════╗\n"
+        f"     🌐     YOUR PROFILE      🌐\n"
+        f"╚══════════════════╝\n"
+        f"Nickname: {html.escape(nickname)}\n"
+        f"Role: Student (Default)\n"
+        f"Year: {year_line}\n\n"
+        f"🏅 Level: {level} — <i>{title}</i>\n"
+        f"✨ XP: {xp:,}  [{bar}]  → {xp_end:,}\n\n"
+        f"🔥 Current streak: {streak} days\n"
+        f"🏅 Best streak: {streak_best} days\n\n"
+        f"📚 Questions\n"
+        f"   Answered: {lec_answered:,}\n"
+        f"   Correct: {lec_correct:,}\n"
+        f"   Accuracy: {accuracy:.1f}%\n\n"
+        f"🧠 Mistakes Bank\n"
+        f"  current: {mistake_count} questions\n\n"
+        f"🏆 <b>Achievements</b>\n{ach_text}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("🏆 Achievements", callback_data="view_achievements"),
@@ -6952,12 +7174,21 @@ async def import_analytics_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         await update.message.reply_text(f"❌ Import failed: {e}")
         return
-    ANALYTICS.update(imported)
+    cleaned = _clean_analytics_dict(imported)
+    if not cleaned:
+        await update.message.reply_text(
+            "❌ Import failed: nothing in that file looked like a valid analytics entry "
+            "(expected {\"<telegram_user_id>\": {...}, ...}). Wrong file?"
+        )
+        return
+    ANALYTICS.update(cleaned)
     await save_analytics()
     _analytics_dirty = False   # disk now matches memory — nothing left for the periodic flush to do
     await backup_analytics_to_channel(context)
+    dropped = len(imported) - len(cleaned)
+    note = f" ({dropped} malformed entr{'y' if dropped == 1 else 'ies'} skipped)" if dropped else ""
     await update.message.reply_text(
-        f"✅ Imported <b>{len(imported)}</b> user(s) — merged into current data, "
+        f"✅ Imported <b>{len(cleaned)}</b> user(s){note} — merged into current data, "
         f"saved locally, and re-pinned to the backup channel.\n"
         f"Total users on file now: <b>{len(ANALYTICS)}</b>.",
         parse_mode=ParseMode.HTML,
@@ -7154,6 +7385,85 @@ app = (
 # ERROR_LOG_GROUP_ID instead. Wrapped in its own try/except since the
 # last thing an error handler should do is raise another error.
 # ═══════════════════════════════════════════════════════════════
+def _describe_update(update: object) -> str:
+    """A short, human-readable line describing what was happening when
+    this update came in — who, and what they did (typed a command,
+    tapped a button, sent a poll answer, ...) — so the errors channel
+    reads like 'Kareem tapped button toggle_language' instead of making
+    a reader reconstruct that from the raw update JSON below it. Falls
+    back to a plain label if update isn't a normal Update (e.g. an error
+    raised from a job_queue task, which has no update at all)."""
+    if not isinstance(update, Update):
+        return "(no update — this came from a background job/task, not a live user update)"
+
+    who = "unknown user"
+    if update.effective_user:
+        u = update.effective_user
+        uname = f"@{u.username}" if u.username else (u.full_name or "no name")
+        who = f"{uname} (id {u.id})"
+
+    if update.callback_query:
+        action = f"tapped button: {update.callback_query.data!r}"
+    elif update.message and update.message.text:
+        action = f"sent message: {update.message.text[:120]!r}"
+    elif update.message and update.message.poll:
+        action = "sent a poll"
+    elif update.poll_answer:
+        action = f"answered poll {update.poll_answer.poll_id}"
+    elif update.message:
+        action = "sent a non-text message (photo/document/etc.)"
+    else:
+        action = "sent an unrecognized update type"
+
+    chat_kind = f" in {update.effective_chat.type} chat {update.effective_chat.id}" if update.effective_chat else ""
+    return f"{who} {action}{chat_kind}"
+
+def _likely_cause(exc: BaseException) -> str | None:
+    """A short plain-English guess at what caused this, based on common
+    failure patterns in a python-telegram-bot app — matches on exception
+    type, and for a few Telegram-specific ones, on substrings Telegram's
+    API is known to send back. Purely heuristic: meant to save a first
+    read-through of the traceback, not to replace it, so it's fine (and
+    expected) for this to return None on anything it doesn't recognize —
+    the full traceback is always still attached below it."""
+    msg = str(exc).lower()
+
+    if isinstance(exc, Forbidden):
+        return "The bot tried to message someone who blocked it, left the chat, or kicked the bot — nothing to fix in the code, just an unreachable user."
+    if isinstance(exc, RetryAfter):
+        return f"Hit Telegram's flood/rate limit — sent too many requests too fast (retry after {getattr(exc, 'retry_after', '?')}s). Usually transient."
+    if isinstance(exc, BadRequest):
+        if "message is not modified" in msg:
+            return "Tried to edit a message with identical text/markup — Telegram rejects no-op edits. Usually harmless."
+        if "message to edit not found" in msg or "message can't be edited" in msg:
+            return "The message the bot tried to edit was deleted, too old, or never existed (e.g. a stale button left on an old message)."
+        if "query is too old" in msg or "query id is invalid" in msg or "response timeout expired" in msg:
+            return "A button was tapped after its callback query expired — usually a very old message, or the bot restarted since the button was shown."
+        if "chat not found" in msg:
+            return "Tried to message a chat/group ID the bot isn't actually a member of (or that ID is wrong)."
+        if "not enough rights" in msg or "have no rights" in msg:
+            return "The bot isn't an admin (or lacks a specific permission) in that group/channel."
+        return "Telegram rejected the request outright — check the exact parameters of the call against the message above."
+    # NOTE: BadRequest is (surprisingly) a subclass of NetworkError in
+    # python-telegram-bot, so this catch-all MUST come after the
+    # BadRequest check above, or every BadRequest gets misclassified as
+    # a transient network blip instead of getting its specific message.
+    if isinstance(exc, (TimedOut, NetworkError)):
+        return "Telegram's API was slow or briefly unreachable — usually transient, not a code bug."
+    if isinstance(exc, KeyError):
+        return f"Code expected key {exc} in a dict that didn't have it — often a data-shape mismatch (a settings/analytics/mistakes-bank entry missing a field) or a callback_data referencing something that no longer exists."
+    if isinstance(exc, IndexError):
+        return "Code indexed into a list/string shorter than expected — often an off-by-one, or content split into fewer parts than assumed."
+    if isinstance(exc, AttributeError) and "nonetype" in msg:
+        return "Code called a method/attribute on something that was None — usually a lookup (dict.get, a file/record read) that came back empty and wasn't checked before use."
+    if isinstance(exc, json.JSONDecodeError):
+        return "Malformed JSON was being parsed — check whichever file or channel backup was being loaded at the time."
+    if isinstance(exc, ValueError):
+        return "A conversion or parse step got a value it couldn't handle (e.g. int()/float() on non-numeric text, or unexpected formatting)."
+    if isinstance(exc, TypeError):
+        return "A function got an argument of the wrong type or count — often None sneaking in where a real value was expected."
+    return None
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     tb_string = "".join(traceback.format_exception(
         None, context.error, context.error.__traceback__
@@ -7163,13 +7473,20 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     if not ERROR_LOG_GROUP_ID:
         return
 
+    who_what   = _describe_update(update)
+    cause      = _likely_cause(context.error)
+    cause_line = f"🕵️ <b>Likely cause:</b> {html.escape(cause)}\n\n" if cause else ""
+
     update_str = update.to_dict() if isinstance(update, Update) else str(update)
-    # Telegram messages cap at 4096 chars — keep well under that.
+    # Telegram messages cap at 4096 chars — keep well under that even
+    # with the two new lines above (who/what + likely cause) added.
     report = (
         f"🚨 <b>Bot error</b>\n"
+        f"👤 <b>Who/what:</b> {html.escape(who_what)}\n"
         f"<b>{type(context.error).__name__}:</b> {html.escape(str(context.error))}\n\n"
-        f"<b>Update:</b>\n<code>{html.escape(str(update_str))[:1200]}</code>\n\n"
-        f"<b>Traceback:</b>\n<code>{html.escape(tb_string)[-2000:]}</code>"
+        f"{cause_line}"
+        f"<b>Update:</b>\n<code>{html.escape(str(update_str))[:900]}</code>\n\n"
+        f"<b>Traceback:</b>\n<code>{html.escape(tb_string)[-1800:]}</code>"
     )
     try:
         await context.bot.send_message(
