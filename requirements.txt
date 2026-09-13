@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue,rate-limiter]>=21.0
+reportlab
+python-docx
+requests
+PyMuPDF
