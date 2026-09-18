@@ -1302,6 +1302,22 @@ async def scenario_mistakes_bank_abuse(mod, fake_bot, base_user_id: int, num_use
     lecture_entry = mod.QUIZ_INDEX[year][f"{subject} Lecture 1"]
     shared_mid = lecture_entry["ids"][0]
     victim = base_user_id
+    other_users = [base_user_id + 1 + i for i in range(max(5, min(num_users, 40)))]
+
+    # mistakes_bank.json is loaded from local disk at import time and
+    # persists across SEPARATE runs of this script in the same folder —
+    # unlike the perf/correctness scenarios, this one uses a fixed
+    # user-id range (base_user_id), so a second run in the same directory
+    # would otherwise find these ids' entries already recorded from last
+    # time, and every dedup check below would correctly (but confusingly)
+    # report "0 new entries" — not because dedup is broken, but because
+    # there was nothing new left to record. Purging this scenario's own
+    # fixed id range up front makes it self-contained regardless of what
+    # a previous run in this folder left behind.
+    abuse_ids = {victim, *other_users}
+    mod.MISTAKES_BANK[:] = [m for m in mod.MISTAKES_BANK if m.get("user_id") not in abuse_ids]
+    for uid in abuse_ids:
+        mod._MISTAKES_BY_USER.pop(uid, None)
 
     # ── 1. Same user, same question, fired concurrently many times ──────
     before_count = len(mod._MISTAKES_BY_USER.get(victim, []))
@@ -1322,7 +1338,6 @@ async def scenario_mistakes_bank_abuse(mod, fake_bot, base_user_id: int, num_use
         )
 
     # ── 2. Many DIFFERENT users concurrently missing the SAME question ──
-    other_users = [base_user_id + 1 + i for i in range(max(5, min(num_users, 40)))]
     bank_len_before = len(mod.MISTAKES_BANK)
     try:
         with capture_diagnostics() as diag:
