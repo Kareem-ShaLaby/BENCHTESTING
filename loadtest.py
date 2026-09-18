@@ -1,33 +1,44 @@
 #!/usr/bin/env python3
 """
-loadtest.py — hot-path latency test for The Quizician bot.
+loadtest.py — hot-path latency AND correctness test for The Quizician bot.
 
 WHAT THIS DOES
 ---------------
 Imports your actual bot.py (with every Telegram network call replaced by
 an in-memory fake that responds instantly, or after a configurable fake
-delay) and fires N simulated concurrent "students" at the real hot-path
-functions:
+delay) and exercises it two different ways:
 
-  - poll_answer  : the full _advance_lecture_session flow, same as a real
-                   student answering a lecture question (correct/wrong,
-                   XP, mistakes-bank recording, spaced repetition, next-
-                   question delivery — all the real logic, no shortcuts).
-  - daily_quiz   : build_daily_quiz_questions + start_daily_quiz, the
-                   exact path that crashed in production once already
-                   (the mistakes-bank KeyError) and the most expensive
-                   per-tap operation in the bot (see the O(n) fixes
-                   earlier in the conversation this script came out of).
+  1. PERFORMANCE scenarios (poll_answer, daily_quiz) — fire N simulated
+     concurrent "students" at the hot-path functions and report
+     p50/p95/p99 latency. Unchanged in spirit from the original version
+     of this script.
+
+  2. CORRECTNESS scenarios (full_lecture, full_daily_quiz, achievements,
+     race, sessions) — drive complete, realistic user journeys through
+     the REAL entrypoints (handle_poll_answer, not the internal
+     _advance_* functions directly) and then check the resulting state
+     against independently-recomputed expectations: XP/level
+     consistency, whether each achievement tier is exactly the one the
+     underlying stat should have unlocked (no skipped tier, no
+     over-unlock), the achievement_collector meta-tier + XP multiplier,
+     same-user double-tap deduplication (@_serialize_per_user), and the
+     LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
+     snapshot/restore round trip added for -1004499530524's persistence.
+
+     These don't just check "did it crash" — they check "did it produce
+     the RIGHT numbers," which a pure latency test can't tell you. A
+     function that silently double-counts XP or skips an achievement
+     tier still returns fast.
 
 It does NOT touch Telegram, Railway, or your real channels — everything
 that would normally be a network call becomes a fast in-memory stand-in.
-That means this measures YOUR CODE'S latency under concurrency, not
-Telegram's API latency or network conditions. That's deliberate: your
-code is the thing you can actually change, and it's usually the actual
-bottleneck (see the O(n) scans this conversation already found and
-fixed) — Telegram's rate limiter (AIORateLimiter, already in your
-ApplicationBuilder) governs the network side separately, and no amount
-of load-testing here changes what Telegram allows per second.
+That means this measures YOUR CODE'S behavior and latency under
+concurrency, not Telegram's API latency or network conditions. That's
+deliberate: your code is the thing you can actually change, and it's
+usually the actual bottleneck — Telegram's rate limiter (AIORateLimiter,
+already in your ApplicationBuilder) governs the network side separately,
+and no amount of load-testing here changes what Telegram allows per
+second.
 
 HOW TO RUN
 ----------
@@ -40,11 +51,22 @@ HOW TO RUN
    active — this script imports bot.py directly, so it needs everything
    bot.py needs.
 3. Run:
-       python3 loadtest.py --scenario poll_answer --users 700
-       python3 loadtest.py --scenario daily_quiz  --users 700
-       python3 loadtest.py --scenario both        --users 200 500 700
-4. Read the p50/p95/p99 numbers it prints. See "READING THE RESULTS"
-   at the bottom of this file for what to actually do with them.
+       python3 loadtest.py --scenario poll_answer   --users 700
+       python3 loadtest.py --scenario daily_quiz    --users 700
+       python3 loadtest.py --scenario full_lecture  --users 200
+       python3 loadtest.py --scenario full_daily_quiz --users 200
+       python3 loadtest.py --scenario achievements  --users 50
+       python3 loadtest.py --scenario race          --users 200
+       python3 loadtest.py --scenario sessions      --users 50
+       python3 loadtest.py --scenario session_abuse
+       python3 loadtest.py --scenario mistakes_bank_abuse
+       python3 loadtest.py --scenario perf          # both perf scenarios
+       python3 loadtest.py --scenario correctness   # every per-user correctness scenario
+       python3 loadtest.py --scenario abuse         # both abuse scenarios
+       python3 loadtest.py --scenario all           # literally everything (default)
+4. Read the p50/p95/p99 numbers for perf scenarios, and the PASS/FAIL +
+   violation list for correctness scenarios. See "READING THE RESULTS"
+   at the bottom of this file for what to actually do with either.
 
 DATA SAFETY — READ THIS BEFORE RUNNING AGAINST YOUR REAL DATA DIRECTORY
 ------------------------------------------------------------------------
@@ -54,8 +76,8 @@ write real local JSON files. It does NOT call any backup_*_to_channel
 function for real (those are network calls and get stubbed out), so your
 Telegram channel backups are never touched. But your LOCAL .json files
 in the working directory WILL be modified with fake load-test data
-(fake user IDs, fake XP, fake mistakes-bank entries) unless you run this
-in an isolated directory.
+(fake user IDs, fake XP, fake mistakes-bank entries, fake sessions.json)
+unless you run this in an isolated directory.
 
 Recommended: copy bot.py + this script into a throwaway folder with NO
 existing .json files, so the bot starts with empty state and everything
@@ -73,10 +95,14 @@ WHAT GETS FAKED
   to Telegram (bot.py calls this unconditionally at the bottom of the
   file, with no `if __name__ == "__main__"` guard).
 - app.bot: replaced with a FakeBot whose send_message/send_poll/
-  set_message_reaction/send_document/pin_chat_message/etc. all return
-  quickly (optionally with a simulated network delay via --fake-latency-ms)
-  instead of calling Telegram. This is the actual trick that makes any
-  of this possible without a real bot token or real Telegram access.
+  send_photo/set_message_reaction/send_document/pin_chat_message/
+  stop_poll/copy_messages/etc. all return quickly (optionally with a
+  simulated network delay via --fake-latency-ms) instead of calling
+  Telegram. FakeBot's __getattr__ catch-all makes any bot.<method>() it
+  doesn't explicitly fake raise a loud, named AttributeError instead of
+  a confusing failure deep in python-telegram-bot — if a scenario hits
+  this, it means bot.py added a new Telegram call this script's FakeBot
+  needs a fake for; that's a real finding, not a bug in your bot.
 - Channel restore/backup calls (restore_*_from_channel,
   backup_*_to_channel): these still run as real code, but since app.bot
   is fake, every Telegram call inside them hits the FakeBot instead —
@@ -86,18 +112,52 @@ WHAT GETS FAKED
 
 WHAT DOESN'T GET FAKED (this is still your real code running)
 ----------------------------------------------------------------
-- All scoring/XP/streak/achievement logic
-- The mistakes-bank recording and lookup (the exact code that had the
-  KeyError bug)
-- The spaced-repetition re-ask logic
-- The O(1) poll_status_by_mid indexing this conversation added
+- All scoring/XP/streak/achievement/level logic
+- The mistakes-bank recording and lookup
+- The spaced-repetition re-ask logic (disabled per-user in the
+  correctness scenarios below, deliberately — see run_full_lecture's
+  docstring for why)
+- @_serialize_per_user's per-user asyncio.Lock (exercised for real by
+  the "race" scenario, which calls handle_poll_answer directly instead
+  of the internal _advance_* functions)
+- LECTURE_SESSIONS/DAILY_QUIZ_SESSIONS/MISTAKES_RETAKE_SESSIONS
+  snapshot/restore, if your bot.py has the SESSION PERSISTENCE section
+  (the "sessions" scenario exercises the real functions; it prints a
+  skip notice, not a failure, if your bot.py predates that feature)
+- The O(1) poll_status_by_mid indexing
 - JSON file writes via _atomic_write_json (real disk I/O, on your
   machine — this is deliberate: disk I/O latency under concurrent load
   is a real thing worth measuring, not something to fake away)
+
+HOW ERRORS ARE DETECTED (read this if a run says PASS but you're not sure)
+---------------------------------------------------------------------------
+Three independent layers, because a bug can hide from any one of them:
+  1. Uncaught exceptions propagating out of a scenario — the obvious case.
+  2. Printed diagnostics — a lot of this bot's own error handling is
+     "print a message and swallow the exception" (by design, so one
+     user's bad data can't break another's request). That's the right
+     production behavior, but it means a real bug can be completely
+     invisible to a test that only watches for raised exceptions. This
+     script captures stdout during every scenario and flags any line
+     containing "error", "failed", "traceback", or "exception"
+     (case-insensitive) as a Printed Diagnostic — these are shown
+     separately from hard failures since a few are load-test artifacts
+     (e.g. FakeBot.get_file's deliberate RuntimeError, which only fires
+     if a restore path actually finds a pinned document — it never
+     should here, since FakeChat.pinned_message is always None), but
+     most are worth reading.
+  3. Invariant violations — independent recomputation of what SHOULD be
+     true (XP/level consistency, achievement tier correctness, answered
+     == correct + incorrect, no leaked sessions) checked against what
+     actually ended up in ANALYTICS/LECTURE_SESSIONS/etc. This is what
+     catches "it didn't crash, but the numbers are wrong."
 """
 
 import argparse
 import asyncio
+import contextlib
+import io
+import json
 import os
 import random
 import statistics
@@ -200,6 +260,11 @@ class FakeBot:
         await self._delay()
         return _FakeMessage(chat_id, is_poll=True)
 
+    async def send_photo(self, chat_id, photo=None, **kwargs):
+        self._count("send_photo")
+        await self._delay()
+        return _FakeMessage(chat_id)
+
     async def send_document(self, chat_id, document=None, **kwargs):
         self._count("send_document")
         await self._delay()
@@ -224,6 +289,16 @@ class FakeBot:
         self._count("delete_message")
         await self._delay()
         return True
+
+    async def stop_poll(self, chat_id, message_id, **kwargs):
+        self._count("stop_poll")
+        await self._delay()
+        return types.SimpleNamespace(id=f"fakepoll-stopped-{message_id}")
+
+    async def copy_messages(self, chat_id, from_chat_id, message_ids, **kwargs):
+        self._count("copy_messages")
+        await self._delay()
+        return [types.SimpleNamespace(message_id=m) for m in message_ids]
 
     async def edit_message_text(self, chat_id, message_id, text=None, **kwargs):
         self._count("edit_message_text")
@@ -254,13 +329,80 @@ class FakeBot:
     # fake doesn't explicitly implement fails LOUDLY and NAMED, instead
     # of a confusing AttributeError deep in python-telegram-bot's own
     # code. If you hit this, add the method above following the same
-    # pattern as the others.
+    # pattern as the others — and treat hitting it at all as a genuine
+    # finding: it means this script's FakeBot coverage has fallen behind
+    # bot.py's actual Telegram usage.
     def __getattr__(self, name):
         raise AttributeError(
             f"FakeBot has no fake implementation of bot.{name}() yet — "
             f"add one in loadtest.py's FakeBot class, following the pattern "
             f"of the other methods there."
         )
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 2b — fake Update/PollAnswer objects, for driving REAL entrypoints
+# ─────────────────────────────────────────────────────────────────
+# The original version of this script called _advance_lecture_session /
+# _advance_daily_quiz_session directly — real logic, but bypassing
+# handle_poll_answer's own routing (current_poll_id / pending_polls
+# matching, the "no session — did the bot restart?" fallback, spaced
+# repetition dispatch) AND @_serialize_per_user's per-user lock entirely.
+# A race-condition bug in either of those would be invisible to a test
+# that never goes through handle_poll_answer. The correctness scenarios
+# below go through it for real; the original perf scenarios are kept
+# calling the internal functions directly, since that's still the right
+# choice for isolating raw per-answer latency from routing overhead.
+class _FakePollAnswerObj:
+    def __init__(self, poll_id: str, user_id: int, option_ids: list):
+        self.poll_id = poll_id
+        self.user = types.SimpleNamespace(
+            id=user_id, first_name="Load", last_name="Test", username=f"loadtest{user_id}",
+        )
+        self.option_ids = option_ids
+
+
+class _FakeUpdate:
+    """Minimal stand-in for telegram.Update — just enough shape for
+    handle_poll_answer and @_serialize_per_user (update.effective_user,
+    update.poll_answer)."""
+
+    def __init__(self, poll_id: str, user_id: int, option_ids: list):
+        self.poll_answer = _FakePollAnswerObj(poll_id, user_id, option_ids)
+        self.effective_user = self.poll_answer.user
+
+
+async def answer_poll(mod, ctx, user_id: int, poll_id, option_id) -> None:
+    """Simulates a real Telegram PollAnswerHandler firing: builds a fake
+    Update and calls the bot's REAL handle_poll_answer, lock and all."""
+    update = _FakeUpdate(poll_id, user_id, [option_id] if option_id is not None else [])
+    await mod.handle_poll_answer(update, ctx)
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 2c — capture stdout so swallowed-exception prints aren't invisible
+# ─────────────────────────────────────────────────────────────────
+_SUSPICIOUS_MARKERS = ("error", "failed", "traceback", "exception")
+
+
+@contextlib.contextmanager
+def capture_diagnostics():
+    """Captures everything printed during the `with` block and returns
+    (after the block exits) the subset of lines that look like an error
+    the bot swallowed internally rather than raised. Doesn't touch
+    sys.stderr — uncaught exceptions still propagate and fail the
+    scenario normally; this is purely for the "printed, not raised"
+    class of bug this bot's many `except Exception: print(...)` blocks
+    can otherwise hide from a test."""
+    buf = io.StringIO()
+    holder = {"lines": []}
+    with contextlib.redirect_stdout(buf):
+        yield holder
+    for line in buf.getvalue().splitlines():
+        if line.startswith("[loadtest]"):
+            continue  # our own progress/status lines, not the bot's
+        if any(marker in line.lower() for marker in _SUSPICIOUS_MARKERS):
+            holder["lines"].append(line)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -292,7 +434,12 @@ def seed_fake_data(mod, num_lectures: int = 5, questions_per_lecture: int = 10):
     closed lectures + fake poll content, so build_daily_quiz_questions
     and the lecture-delivery path have real (if fabricated) data to work
     with — without this, every scenario would just find an empty pool
-    and return instantly, which measures nothing."""
+    and return instantly, which measures nothing.
+
+    Every fake question has exactly 4 options (Option A-D) with a random
+    correct_option_id — scenarios that need a deliberately-wrong answer
+    pick (correct_option_id + 1) % 4, which is always a valid, distinct,
+    definitely-wrong option given that shape."""
     year = "y1"
     module = next(iter(mod.year_modules(year)), None)
     if module is None:
@@ -348,8 +495,27 @@ def make_fake_context(mod, fake_bot):
     return ctx
 
 
+def _prep_user_settings(mod, user_id: int, *, auto_next: bool = True, spaced_repetition: bool = False) -> None:
+    """Common setup every correctness scenario needs: a valid year_class
+    (WITHOUT this, start_daily_quiz just prompts for one and never builds
+    a session at all — see the "THE YEAR_CLASS BUG" note in
+    scenario_daily_quiz below, which is exactly this mistake), and
+    spaced_repetition OFF by default so a deterministic-looking driving
+    loop (answer current_poll_id, expect the next one) isn't quietly
+    interrupted by an unrelated re-ask poll. Spaced repetition has its
+    own real code and isn't disabled anywhere except in these test
+    fixtures — this is a test-harness simplification, not a claim that
+    SR itself doesn't need its own testing."""
+    entry = mod._get_settings_entry(user_id)
+    entry["year_class"] = "y1"
+    entry["auto_next"] = auto_next
+    entry["spaced_repetition"] = spaced_repetition
+
+
 # ─────────────────────────────────────────────────────────────────
-# STEP 5 — the two scenarios
+# STEP 5 — PERFORMANCE scenarios (unchanged in spirit from the original
+# version of this script — internal functions called directly, to
+# isolate per-answer hot-path latency from routing/lock overhead)
 # ─────────────────────────────────────────────────────────────────
 @dataclass
 class RunResult:
@@ -405,13 +571,21 @@ async def scenario_poll_answer(mod, fake_bot, user_id: int, year: str, module: s
 
 async def scenario_daily_quiz(mod, fake_bot, user_id: int) -> float:
     """One simulated student tapping the 💥Daily Quiz💥 button: runs the
-    REAL build_daily_quiz_questions (the exact function that crashed in
-    production from the mistakes-bank KeyError, and the one with the
-    O(n)-scan-turned-cache fix from earlier in this conversation) plus
-    start_daily_quiz's setup work. This is deliberately the single
-    heaviest per-tap operation in the whole bot, so it's the one most
-    worth knowing the p95 for."""
+    REAL build_daily_quiz_questions plus start_daily_quiz's setup work.
+
+    THE YEAR_CLASS BUG (fixed here): a fake user's SETTINGS entry starts
+    with year_class=None (see _blank_settings_entry), and start_daily_quiz
+    checks that FIRST — if it's not set, it just sends the "pick your
+    year/class" prompt and returns immediately, WITHOUT ever calling
+    get_daily_quiz_questions/build_daily_quiz_questions. The previous
+    version of this scenario never set year_class, so every "daily_quiz"
+    perf run was silently timing that instant prompt-and-return path, not
+    the expensive question-build path the docstring claimed to measure —
+    it would never have caught a regression in build_daily_quiz_questions
+    at all. _prep_user_settings fixes this by setting year_class="y1"
+    before every run."""
     ctx = make_fake_context(mod, fake_bot)
+    _prep_user_settings(mod, user_id)
     # Reset this user's daily-quiz gate so every simulated tap actually
     # runs the full build, instead of hitting the "already did it today"
     # short-circuit after the first call.
@@ -422,11 +596,822 @@ async def scenario_daily_quiz(mod, fake_bot, user_id: int) -> float:
     await mod.start_daily_quiz(ctx, user_id)
     t1 = time.perf_counter()
 
+    if user_id not in mod.DAILY_QUIZ_SESSIONS:
+        raise RuntimeError(
+            "start_daily_quiz did not create a session — check that seed_fake_data "
+            "actually populated ready questions for year 'y1', and that year_class "
+            "setup above still matches how your bot.py gates this."
+        )
     mod.DAILY_QUIZ_SESSIONS.pop(user_id, None)
     return (t1 - t0) * 1000
 
 
-async def run_scenario(mod, fake_bot, scenario: str, num_users: int, year, module, subject) -> RunResult:
+# ─────────────────────────────────────────────────────────────────
+# STEP 5b — CORRECTNESS scenarios
+# ─────────────────────────────────────────────────────────────────
+@dataclass
+class CorrectnessResult:
+    violations: list = field(default_factory=list)
+    diagnostics: list = field(default_factory=list)   # suspicious prints, not necessarily fatal
+    errors: list = field(default_factory=list)         # uncaught exceptions
+    runs: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return not self.violations and not self.errors
+
+
+def verify_analytics_invariants(mod, user_id: int) -> list:
+    """Recomputes what each ACHIEVEMENTS tier and the achievement_collector
+    meta-tier SHOULD be, purely from the entry's own stat fields (reading
+    the bot's own ACHIEVEMENTS/ACHIEVEMENT_STAT_FIELD threshold tables,
+    not re-deriving the trigger logic), and flags any mismatch against
+    what's actually stored — plus a handful of structural invariants that
+    should hold for ANY user's entry no matter what path produced it."""
+    violations = []
+    entry = mod.ANALYTICS.get(str(user_id))
+    if entry is None:
+        return [f"user {user_id}: no analytics entry found"]
+
+    answered  = entry.get("lecture_questions_answered", 0)
+    correct   = entry.get("lecture_questions_correct", 0)
+    incorrect = entry.get("lecture_questions_incorrect", 0)
+    if answered != correct + incorrect:
+        violations.append(
+            f"user {user_id}: lecture_questions_answered ({answered}) != "
+            f"lecture_questions_correct ({correct}) + lecture_questions_incorrect ({incorrect})"
+        )
+
+    xp, level = entry.get("xp", 0), entry.get("level", 0)
+    if xp < 0:
+        violations.append(f"user {user_id}: negative xp ({xp})")
+    expected_level = mod._xp_to_level(xp)
+    if level != expected_level:
+        violations.append(
+            f"user {user_id}: level ({level}) != _xp_to_level(xp) ({expected_level}) for xp={xp}"
+        )
+
+    ach = entry.get("achievements", {})
+    for stat_key, tiers in mod.ACHIEVEMENTS.items():
+        if stat_key == "achievement_collector":
+            continue   # meta-category, checked separately below
+        field_name = mod.ACHIEVEMENT_STAT_FIELD.get(stat_key, stat_key)
+        actual_tier = ach.get(stat_key, 0)
+        expected_tier = 0
+        for i, tier_def in enumerate(tiers):
+            threshold = tier_def[0]
+            tier = i + 1
+            value = xp if (stat_key == "xp_levels" and i == 0) else entry.get(field_name, 0)
+            if value >= threshold:
+                expected_tier = tier
+            else:
+                break
+        if actual_tier != expected_tier:
+            check_value = xp if stat_key == "xp_levels" else entry.get(field_name, 0)
+            violations.append(
+                f"user {user_id}: '{stat_key}' achievement tier is {actual_tier}, "
+                f"expected {expected_tier} (stat value: {check_value})"
+            )
+        if actual_tier > len(tiers):
+            violations.append(
+                f"user {user_id}: '{stat_key}' tier {actual_tier} exceeds its {len(tiers)} defined tiers"
+            )
+
+    total_unlocked = mod._total_achievements_unlocked(entry)
+    ac_tiers = mod.ACHIEVEMENTS["achievement_collector"]
+    expected_ac_tier, expected_multiplier = 0, 1.0
+    for i, tier_def in enumerate(ac_tiers):
+        threshold, multiplier = tier_def[0], tier_def[2]
+        if total_unlocked >= threshold:
+            expected_ac_tier, expected_multiplier = i + 1, multiplier
+        else:
+            break
+    actual_ac_tier = ach.get("achievement_collector", 0)
+    if actual_ac_tier != expected_ac_tier:
+        violations.append(
+            f"user {user_id}: achievement_collector tier is {actual_ac_tier}, "
+            f"expected {expected_ac_tier} (total other achievements unlocked: {total_unlocked})"
+        )
+    actual_multiplier = entry.get("xp_multiplier", 1.0)
+    if actual_ac_tier > 0 and actual_multiplier != expected_multiplier:
+        violations.append(
+            f"user {user_id}: xp_multiplier is {actual_multiplier}, expected {expected_multiplier} "
+            f"for achievement_collector tier {actual_ac_tier}"
+        )
+    elif actual_ac_tier == 0 and actual_multiplier != 1.0:
+        violations.append(
+            f"user {user_id}: xp_multiplier is {actual_multiplier} but no achievement_collector "
+            f"tier is unlocked — multiplier should still be the default 1.0"
+        )
+
+    return violations
+
+
+def verify_no_leaked_sessions(mod, user_id: int) -> list:
+    """A user who FINISHED a lecture/daily-quiz/retake session shouldn't
+    still have an entry in the corresponding in-memory dict — that's
+    exactly the kind of slow leak STALE_SESSION_IDLE_SECONDS' own comment
+    warns is possible if something forgets to pop one."""
+    violations = []
+    for name, sessions in (
+        ("LECTURE_SESSIONS", mod.LECTURE_SESSIONS),
+        ("DAILY_QUIZ_SESSIONS", mod.DAILY_QUIZ_SESSIONS),
+        ("MISTAKES_RETAKE_SESSIONS", mod.MISTAKES_RETAKE_SESSIONS),
+    ):
+        if user_id in sessions:
+            violations.append(f"user {user_id}: still has a leftover entry in {name} after finishing")
+    return violations
+
+
+async def run_full_lecture(mod, fake_bot, user_id: int, year: str, module: str, subject: str,
+                            lecture_key: str, correct_rate: float = 0.85, auto_next: bool = True) -> dict:
+    """Drives ONE complete lecture, start to finish, through the REAL
+    handle_poll_answer entrypoint (not _advance_lecture_session directly)
+    for every question — so routing, current_poll_id/pending_polls
+    matching, and @_serialize_per_user all run for real, same as an
+    actual student tapping through a quiz. Returns what the driver itself
+    expects (answered/correct counts), for the caller to check against
+    what ANALYTICS actually ended up recording.
+
+    Spaced repetition is turned OFF for this session (see
+    _prep_user_settings) specifically so this loop's "answer
+    current_poll_id, expect exactly the next fresh question" structure
+    stays valid — a re-ask would otherwise inject an extra poll this
+    driver doesn't know how to route without also duplicating SR's own
+    trigger logic here. Auto-next mode drives one question at a time;
+    batch mode (auto_next=False) sends the whole lecture up front, then
+    answers every pending poll in the order they were delivered."""
+    ctx = make_fake_context(mod, fake_bot)
+    _prep_user_settings(mod, user_id, auto_next=auto_next, spaced_repetition=False)
+
+    lecture_entry = mod.QUIZ_INDEX[year][lecture_key]
+    ready_ids = list(lecture_entry["ids"])
+    poll_status_by_mid = {
+        v["message_id"]: v for v in mod.QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key
+    }
+    already_attempted = str(user_id) in mod._get_lecture_results(mod._lr_key(year, lecture_key))
+    session = {
+        "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+        "queue": ready_ids, "current_poll_id": None, "current_correct_id": None,
+        "total": len(ready_ids), "answered": 0, "correct": 0,
+        "mode": "auto" if auto_next else "batch",
+        "pending_polls": {}, "award_xp": not already_attempted,
+        "poll_status_by_mid": poll_status_by_mid, "xp_earned": 0,
+        "started_at": time.time(),
+    }
+    mod.LECTURE_SESSIONS[user_id] = session
+
+    expected_answered = expected_correct = 0
+
+    if auto_next:
+        sent = await mod._deliver_next_lecture_question(ctx, user_id, session)
+        while sent:
+            live = mod.LECTURE_SESSIONS.get(user_id)
+            if live is None:
+                break   # finished already (shouldn't happen right after a successful delivery, but be defensive)
+            poll_id, correct_opt = live["current_poll_id"], live["current_correct_id"]
+            is_correct = random.random() < correct_rate
+            chosen = correct_opt if is_correct else (correct_opt + 1) % 4
+            expected_answered += 1
+            expected_correct += 1 if is_correct else 0
+            await answer_poll(mod, ctx, user_id, poll_id, chosen)
+            live = mod.LECTURE_SESSIONS.get(user_id)
+            sent = live is not None and live.get("current_poll_id") is not None
+    else:
+        await mod._deliver_all_lecture_questions(ctx, user_id, session)
+        pending_snapshot = list(session["pending_polls"].items())
+        for poll_id, (correct_opt, _message_id, _mid, _delivered_at) in pending_snapshot:
+            live = mod.LECTURE_SESSIONS.get(user_id)
+            if live is None or poll_id not in live.get("pending_polls", {}):
+                continue   # already resolved somehow — be defensive rather than raise mid-loop
+            is_correct = random.random() < correct_rate
+            chosen = correct_opt if is_correct else (correct_opt + 1) % 4
+            expected_answered += 1
+            expected_correct += 1 if is_correct else 0
+            await answer_poll(mod, ctx, user_id, poll_id, chosen)
+
+    return {
+        "expected_answered": expected_answered,
+        "expected_correct": expected_correct,
+        "finished": user_id not in mod.LECTURE_SESSIONS,
+    }
+
+
+async def scenario_full_lecture(mod, fake_bot, user_id: int, year: str, module: str, subject: str) -> CorrectnessResult:
+    """Correctness check for ONE full lecture: drives it to completion,
+    then verifies the resulting ANALYTICS deltas match what was actually
+    fed in, plus every achievement-tier/XP/level invariant."""
+    result = CorrectnessResult(runs=1)
+    lecture_key = f"{subject} Lecture 1"
+    before_entry = dict(mod._get_entry(user_id))
+
+    try:
+        with capture_diagnostics() as diag:
+            outcome = await run_full_lecture(mod, fake_bot, user_id, year, module, subject, lecture_key)
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"user {user_id}: {type(e).__name__}: {e}")
+        return result
+
+    if not outcome["finished"]:
+        result.violations.append(f"user {user_id}: lecture never finished (session still open)")
+
+    after_entry = mod._get_entry(user_id)
+    delta_answered = after_entry.get("lecture_questions_answered", 0) - before_entry.get("lecture_questions_answered", 0)
+    delta_correct  = after_entry.get("lecture_questions_correct", 0) - before_entry.get("lecture_questions_correct", 0)
+    if delta_answered != outcome["expected_answered"]:
+        result.violations.append(
+            f"user {user_id}: lecture_questions_answered increased by {delta_answered}, "
+            f"expected {outcome['expected_answered']}"
+        )
+    if delta_correct != outcome["expected_correct"]:
+        result.violations.append(
+            f"user {user_id}: lecture_questions_correct increased by {delta_correct}, "
+            f"expected {outcome['expected_correct']}"
+        )
+    if after_entry.get("lectures_completed", 0) - before_entry.get("lectures_completed", 0) != 1:
+        result.violations.append(f"user {user_id}: lectures_completed didn't increase by exactly 1")
+
+    result.violations.extend(verify_analytics_invariants(mod, user_id))
+    result.violations.extend(verify_no_leaked_sessions(mod, user_id))
+    return result
+
+
+async def scenario_full_daily_quiz(mod, fake_bot, user_id: int) -> CorrectnessResult:
+    """Correctness check for ONE full Daily Quiz run, driven through the
+    REAL handle_poll_answer entrypoint for every question, checked the
+    same way as scenario_full_lecture."""
+    result = CorrectnessResult(runs=1)
+    ctx = make_fake_context(mod, fake_bot)
+    _prep_user_settings(mod, user_id)
+    entry = mod._get_settings_entry(user_id)
+    entry["daily_quiz_last_date"] = None
+    before_entry = dict(mod._get_entry(user_id))
+    before_completed = before_entry.get("daily_quizzes_completed", 0)
+    expected_answered = expected_correct = 0
+
+    try:
+        with capture_diagnostics() as diag:
+            await mod.start_daily_quiz(ctx, user_id)
+            if user_id not in mod.DAILY_QUIZ_SESSIONS:
+                result.errors.append(
+                    f"user {user_id}: start_daily_quiz did not create a session — "
+                    f"no ready questions for year 'y1'? check seed_fake_data."
+                )
+                return result
+            session = mod.DAILY_QUIZ_SESSIONS[user_id]
+            sent = session.get("current_poll_id") is not None
+            while sent:
+                live = mod.DAILY_QUIZ_SESSIONS.get(user_id)
+                if live is None:
+                    break
+                poll_id, correct_opt = live["current_poll_id"], live["current_correct_id"]
+                is_correct = random.random() < 0.9
+                chosen = correct_opt if is_correct else (correct_opt + 1) % 4
+                expected_answered += 1
+                expected_correct += 1 if is_correct else 0
+                await answer_poll(mod, ctx, user_id, poll_id, chosen)
+                live = mod.DAILY_QUIZ_SESSIONS.get(user_id)
+                sent = live is not None and live.get("current_poll_id") is not None
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"user {user_id}: {type(e).__name__}: {e}")
+        return result
+
+    if user_id in mod.DAILY_QUIZ_SESSIONS:
+        result.violations.append(f"user {user_id}: Daily Quiz session never finished (still open)")
+
+    after_entry = mod._get_entry(user_id)
+    if after_entry.get("daily_quizzes_completed", 0) - before_completed != 1:
+        result.violations.append(f"user {user_id}: daily_quizzes_completed didn't increase by exactly 1")
+    delta_answered = after_entry.get("lecture_questions_answered", 0) - before_entry.get("lecture_questions_answered", 0)
+    if delta_answered != expected_answered:
+        result.violations.append(
+            f"user {user_id}: lecture_questions_answered increased by {delta_answered} from the "
+            f"Daily Quiz run, expected {expected_answered} (Daily Quiz questions count toward the "
+            f"same stat — see _advance_daily_quiz_session's own comment on this)"
+        )
+
+    result.violations.extend(verify_analytics_invariants(mod, user_id))
+    result.violations.extend(verify_no_leaked_sessions(mod, user_id))
+    return result
+
+
+async def scenario_achievements(mod, fake_bot, user_id: int, year: str, module: str, subject: str,
+                                 num_lectures: int) -> CorrectnessResult:
+    """Deliberately pushes ONE user through many real lectures plus a
+    Daily Quiz, at a high correct rate, specifically to unlock several
+    real achievement tiers (not just check the zero-achievement steady
+    state) — questions_answered, correct_streak, lectures_completed,
+    xp_levels, daily_quiz, and achievement_collector should all have
+    fired at least their first tier by the end of this, given enough
+    seeded lectures (num_lectures * questions_per_lecture needs to clear
+    100 for the first questions_answered tier — see seed_fake_data's
+    defaults and this scenario's own --questions-per-lecture/--lectures
+    requirements printed if the run comes up short)."""
+    result = CorrectnessResult(runs=1)
+
+    try:
+        with capture_diagnostics() as diag:
+            for lec_num in range(1, num_lectures + 1):
+                lecture_key = f"{subject} Lecture {lec_num}"
+                if lecture_key not in mod.QUIZ_INDEX[year]:
+                    break   # ran out of seeded lectures — use what we got
+                outcome = await run_full_lecture(
+                    mod, fake_bot, user_id, year, module, subject, lecture_key, correct_rate=0.95,
+                )
+                if not outcome["finished"]:
+                    result.violations.append(f"user {user_id}: lecture {lecture_key} never finished")
+            # Also run one Daily Quiz — cheap, and exercises the daily_quiz
+            # achievement category, which nothing above touches.
+            daily_result = await scenario_full_daily_quiz(mod, fake_bot, user_id)
+            result.diagnostics.extend(daily_result.diagnostics)
+            result.violations.extend(daily_result.violations)
+            result.errors.extend(daily_result.errors)
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"user {user_id}: {type(e).__name__}: {e}")
+        return result
+
+    entry = mod._get_entry(user_id)
+    ach = entry.get("achievements", {})
+    unlocked_something = any(v for k, v in ach.items() if k != "extras") or any(ach.get("extras", {}).values())
+    if not unlocked_something:
+        result.violations.append(
+            f"user {user_id}: completed {num_lectures} lecture(s) + a Daily Quiz at 95% correct "
+            f"and unlocked NOTHING — either the seeded volume is too low to clear tier-1 thresholds "
+            f"(check ACHIEVEMENTS' first-tier numbers against num_lectures * questions_per_lecture) "
+            f"or achievement-unlocking itself is broken"
+        )
+
+    result.violations.extend(verify_analytics_invariants(mod, user_id))
+    result.violations.extend(verify_no_leaked_sessions(mod, user_id))
+    return result
+
+
+async def scenario_same_user_race(mod, fake_bot, user_id: int, year: str, module: str, subject: str) -> CorrectnessResult:
+    """Fires two concurrent handle_poll_answer calls for the SAME live
+    poll from the SAME user — simulating a fast double-tap or a duplicate
+    Telegram update. @_serialize_per_user's per-user lock should force
+    these to run one after the other; by the time the second acquires the
+    lock, current_poll_id has already moved on, so it should see a
+    mismatch and no-op. This is checking your EXISTING protection still
+    works, not something expected to fail — but it's exactly the kind of
+    thing that silently breaks if a future refactor changes which
+    functions the decorator wraps, or how the session dict is looked up."""
+    result = CorrectnessResult(runs=1)
+    ctx = make_fake_context(mod, fake_bot)
+    _prep_user_settings(mod, user_id, auto_next=True, spaced_repetition=False)
+    lecture_key = f"{subject} Lecture 1"
+
+    try:
+        lecture_entry = mod.QUIZ_INDEX[year][lecture_key]
+        poll_status_by_mid = {
+            v["message_id"]: v for v in mod.QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key
+        }
+        session = {
+            "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+            "queue": list(lecture_entry["ids"]), "current_poll_id": None, "current_correct_id": None,
+            "total": len(lecture_entry["ids"]), "answered": 0, "correct": 0,
+            "mode": "auto", "pending_polls": {}, "award_xp": True,
+            "poll_status_by_mid": poll_status_by_mid, "xp_earned": 0, "started_at": time.time(),
+        }
+        mod.LECTURE_SESSIONS[user_id] = session
+
+        with capture_diagnostics() as diag:
+            await mod._deliver_next_lecture_question(ctx, user_id, session)
+            poll_id, correct_opt = session["current_poll_id"], session["current_correct_id"]
+            before_answered = mod._get_entry(user_id).get("lecture_questions_answered", 0)
+
+            # Both "taps" fire concurrently on the same event loop — the
+            # lock inside handle_poll_answer should serialize them, not
+            # let them interleave mid-handler.
+            await asyncio.gather(
+                answer_poll(mod, ctx, user_id, poll_id, correct_opt),
+                answer_poll(mod, ctx, user_id, poll_id, correct_opt),
+            )
+        result.diagnostics.extend(diag["lines"])
+
+        after_answered = mod._get_entry(user_id).get("lecture_questions_answered", 0)
+        delta = after_answered - before_answered
+        if delta != 1:
+            result.violations.append(
+                f"user {user_id}: a double-tap on the same poll advanced "
+                f"lecture_questions_answered by {delta}, expected exactly 1 — "
+                f"@_serialize_per_user may not be protecting handle_poll_answer correctly"
+            )
+    except Exception as e:
+        result.errors.append(f"user {user_id}: {type(e).__name__}: {e}")
+    finally:
+        mod.LECTURE_SESSIONS.pop(user_id, None)
+
+    return result
+
+
+async def scenario_session_persistence(mod, fake_bot, user_id: int, year: str, module: str, subject: str) -> CorrectnessResult:
+    """Exercises the SESSION PERSISTENCE feature (LECTURE_SESSIONS /
+    DAILY_QUIZ_SESSIONS / MISTAKES_RETAKE_SESSIONS snapshot + restore,
+    added for the -1004499530524 channel): builds a live session,
+    snapshots it, wipes the in-memory dicts (simulating a restart), and
+    checks the restored session round-trips correctly — including int
+    keys that had to become strings for JSON and back. Also checks the
+    48h staleness cutoff actually drops an artificially-old session
+    instead of reviving it, without dropping a fresh one alongside it.
+
+    Skips (not fails) if the loaded bot.py predates this feature, so this
+    script stays usable against an older bot.py too."""
+    result = CorrectnessResult(runs=1)
+    if not hasattr(mod, "_sessions_snapshot"):
+        result.diagnostics.append(
+            "SESSION PERSISTENCE not present in this bot.py (no _sessions_snapshot) — skipping."
+        )
+        return result
+
+    lecture_key = f"{subject} Lecture 1"
+    lecture_entry = mod.QUIZ_INDEX[year][lecture_key]
+    poll_status_by_mid = {
+        v["message_id"]: v for v in mod.QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key
+    }
+    session = {
+        "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+        "queue": list(lecture_entry["ids"])[3:], "current_poll_id": "fake-poll-xyz",
+        "current_correct_id": 2, "total": len(lecture_entry["ids"]), "answered": 3, "correct": 2,
+        "mode": "auto", "pending_polls": {}, "award_xp": True,
+        "poll_status_by_mid": poll_status_by_mid, "xp_earned": 45, "started_at": time.time(),
+    }
+    mod.LECTURE_SESSIONS[user_id] = session
+    stale_user_id = user_id + 1
+
+    try:
+        snapshot = mod._sessions_snapshot()
+        if str(user_id) not in snapshot["lecture_sessions"]:
+            result.violations.append(f"user {user_id}: session missing from _sessions_snapshot() output")
+            return result
+
+        # Simulate a restart: wipe the live dicts, restore from the snapshot.
+        mod.LECTURE_SESSIONS.clear()
+        mod.DAILY_QUIZ_SESSIONS.clear()
+        mod.MISTAKES_RETAKE_SESSIONS.clear()
+        mod._restore_sessions_dict(snapshot)
+
+        restored = mod.LECTURE_SESSIONS.get(user_id)
+        if restored is None:
+            result.violations.append(f"user {user_id}: session did not survive the snapshot/restore round trip")
+            return result
+
+        for key in ("year", "module", "subject", "lecture_key", "current_poll_id",
+                    "current_correct_id", "answered", "correct", "xp_earned", "mode", "queue"):
+            if restored.get(key) != session.get(key):
+                result.violations.append(
+                    f"user {user_id}: restored session field {key!r} = {restored.get(key)!r}, "
+                    f"expected {session.get(key)!r}"
+                )
+
+        restored_keys = set(restored.get("poll_status_by_mid", {}).keys())
+        original_keys = set(poll_status_by_mid.keys())
+        if restored_keys != original_keys or not all(isinstance(k, int) for k in restored_keys):
+            result.violations.append(
+                f"user {user_id}: poll_status_by_mid keys didn't round-trip back to int correctly "
+                f"(got {restored_keys!r}, expected {original_keys!r} all as int)"
+            )
+
+        # Staleness cutoff: an old session should be dropped, a fresh one should not.
+        stale_session = dict(session)
+        stale_session["started_at"] = time.time() - mod.SESSIONS_MAX_AGE_SECONDS - 3600  # 1h past the cutoff
+        mod.LECTURE_SESSIONS[stale_user_id] = stale_session
+        stale_snapshot = mod._sessions_snapshot()
+        mod.LECTURE_SESSIONS.clear()
+        mod._restore_sessions_dict(stale_snapshot)
+
+        if stale_user_id in mod.LECTURE_SESSIONS:
+            result.violations.append(
+                f"user {stale_user_id}: a session older than SESSIONS_MAX_AGE_SECONDS "
+                f"({mod.SESSIONS_MAX_AGE_SECONDS}s) was restored instead of dropped"
+            )
+        if user_id not in mod.LECTURE_SESSIONS:
+            result.violations.append(
+                f"user {user_id}: a fresh (non-stale) session was dropped alongside the stale one "
+                f"— the staleness check is too aggressive"
+            )
+    except Exception as e:
+        result.errors.append(f"user {user_id}: {type(e).__name__}: {e}")
+    finally:
+        mod.LECTURE_SESSIONS.pop(user_id, None)
+        mod.LECTURE_SESSIONS.pop(stale_user_id, None)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 5c — ABUSE scenarios
+# ─────────────────────────────────────────────────────────────────
+# Unlike the correctness scenarios above (one clean, realistic journey
+# per simulated user), these deliberately try to break shared state:
+# spam, garbage input, duplicate/replayed events, and many users hammering
+# the exact same resource at once. Each of these runs ONCE per invocation
+# (not once per --correctness-users, the way the scenarios above do) —
+# num_users here controls how many simulated attackers/users the abuse
+# pattern itself uses, since "abuse" is inherently about many actors
+# hitting shared state together, not N independent repeats of one story.
+
+async def scenario_session_abuse(mod, fake_bot, base_user_id: int, num_users: int,
+                                  year: str, module: str, subject: str) -> CorrectnessResult:
+    """Session-handling abuse: non-JSON-serializable session content (the
+    real bug this found — see the SESSION PERSISTENCE fix this prompted),
+    high-fanout duplicate-tap spam, garbage poll_id spam against a live
+    session, a replayed answer after the session already finished, and a
+    soft diagnostic on _user_locks' growth."""
+    result = CorrectnessResult(runs=1)
+    ctx = make_fake_context(mod, fake_bot)
+    lecture_key = f"{subject} Lecture 1"
+    victim = base_user_id
+
+    # ── 1. Non-JSON-serializable session content (sr_asked is a real
+    # Python set — see _maybe_deliver_spaced_repetition) ───────────────
+    if hasattr(mod, "_sessions_snapshot"):
+        _prep_user_settings(mod, victim, auto_next=True, spaced_repetition=True)
+        lecture_entry = mod.QUIZ_INDEX[year][lecture_key]
+        poll_status_by_mid = {
+            v["message_id"]: v for v in mod.QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key
+        }
+        dirty_session = {
+            "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+            "queue": list(lecture_entry["ids"]), "current_poll_id": "fake", "current_correct_id": 0,
+            "total": len(lecture_entry["ids"]), "answered": 5, "correct": 3,
+            "mode": "auto", "pending_polls": {}, "award_xp": True,
+            "poll_status_by_mid": poll_status_by_mid, "xp_earned": 60, "started_at": time.time(),
+            # The actual shapes _maybe_deliver_spaced_repetition produces:
+            "wrong_mids": [lecture_entry["ids"][0], lecture_entry["ids"][1]],
+            "sr_pool": [lecture_entry["ids"][1]],
+            "sr_asked": {lecture_entry["ids"][0]},   # a real set, same as production
+            "sr_counter": 2, "sr_next_threshold": 6,
+        }
+        mod.LECTURE_SESSIONS[victim] = dirty_session
+        try:
+            snapshot = mod._sessions_snapshot()
+            json.dumps(snapshot)   # this alone reproduces the bug if it's still there
+            mod.LECTURE_SESSIONS.clear()
+            mod._restore_sessions_dict(snapshot)
+            restored = mod.LECTURE_SESSIONS.get(victim)
+            if restored is None:
+                result.violations.append(f"user {victim}: session with sr_asked (a set) vanished across snapshot/restore")
+            elif set(restored.get("sr_asked", [])) != dirty_session["sr_asked"]:
+                result.violations.append(
+                    f"user {victim}: sr_asked didn't round-trip correctly "
+                    f"(got {restored.get('sr_asked')!r}, expected {dirty_session['sr_asked']!r})"
+                )
+            elif not isinstance(restored.get("sr_asked"), set):
+                result.violations.append(
+                    f"user {victim}: sr_asked restored as {type(restored.get('sr_asked')).__name__}, "
+                    f"expected a set (spaced-repetition code checks membership/adds to it as a set)"
+                )
+        except TypeError as e:
+            result.violations.append(
+                f"user {victim}: _sessions_snapshot()/json.dumps raised {e!r} on a session that had used "
+                f"spaced repetition — sr_asked is a real Python set (see _maybe_deliver_spaced_repetition), "
+                f"which json.dumps cannot serialize. This would fire in production for ANY active user who's "
+                f"had a spaced-repetition re-ask, silently breaking session persistence's 30s backup tick."
+            )
+        except Exception as e:
+            result.errors.append(f"user {victim}: {type(e).__name__}: {e}")
+        finally:
+            mod.LECTURE_SESSIONS.pop(victim, None)
+    else:
+        result.diagnostics.append("SESSION PERSISTENCE not present in this bot.py — skipping the sr_asked check.")
+
+    # ── 2. High-fanout duplicate-tap spam (same user, same poll, many
+    # concurrent copies — a stress version of the 2-way "race" scenario) ──
+    _prep_user_settings(mod, victim, auto_next=True, spaced_repetition=False)
+    lecture_entry = mod.QUIZ_INDEX[year][lecture_key]
+    poll_status_by_mid = {
+        v["message_id"]: v for v in mod.QUIZ_POLL_STATUS[year].values() if v["lecture"] == lecture_key
+    }
+    session = {
+        "year": year, "module": module, "subject": subject, "lecture_key": lecture_key,
+        "queue": list(lecture_entry["ids"]), "current_poll_id": None, "current_correct_id": None,
+        "total": len(lecture_entry["ids"]), "answered": 0, "correct": 0,
+        "mode": "auto", "pending_polls": {}, "award_xp": True,
+        "poll_status_by_mid": poll_status_by_mid, "xp_earned": 0, "started_at": time.time(),
+    }
+    mod.LECTURE_SESSIONS[victim] = session
+    try:
+        with capture_diagnostics() as diag:
+            await mod._deliver_next_lecture_question(ctx, victim, session)
+            poll_id, correct_opt = session["current_poll_id"], session["current_correct_id"]
+            before_answered = mod._get_entry(victim).get("lecture_questions_answered", 0)
+            fanout = max(5, min(num_users, 30))
+            await asyncio.gather(*(
+                answer_poll(mod, ctx, victim, poll_id, correct_opt) for _ in range(fanout)
+            ))
+        result.diagnostics.extend(diag["lines"])
+        delta = mod._get_entry(victim).get("lecture_questions_answered", 0) - before_answered
+        if delta != 1:
+            result.violations.append(
+                f"user {victim}: {fanout} concurrent identical taps on one poll advanced "
+                f"lecture_questions_answered by {delta}, expected exactly 1"
+            )
+    except Exception as e:
+        result.errors.append(f"user {victim}: {type(e).__name__}: {e}")
+
+    # ── 3. Garbage poll_id spam against a live session ──────────────────
+    try:
+        live = mod.LECTURE_SESSIONS.get(victim)
+        if live is not None:
+            real_poll_id = live.get("current_poll_id")
+            before_answered = mod._get_entry(victim).get("lecture_questions_answered", 0)
+            with capture_diagnostics() as diag:
+                await asyncio.gather(*(
+                    answer_poll(mod, ctx, victim, f"garbage-poll-{i}-{random.random()}", random.randint(0, 3))
+                    for i in range(20)
+                ))
+            result.diagnostics.extend(diag["lines"])
+            after_answered = mod._get_entry(victim).get("lecture_questions_answered", 0)
+            if after_answered != before_answered:
+                result.violations.append(
+                    f"user {victim}: 20 garbage/unknown poll_ids against a live session changed "
+                    f"lecture_questions_answered ({before_answered} -> {after_answered}) — should have been "
+                    f"ignored entirely (see handle_poll_answer's current_poll_id match)"
+                )
+            still_live = mod.LECTURE_SESSIONS.get(victim)
+            if still_live is None or still_live.get("current_poll_id") != real_poll_id:
+                result.violations.append(
+                    f"user {victim}: the real in-flight question was disturbed by unrelated garbage "
+                    f"poll_id spam (current_poll_id changed from {real_poll_id!r} to "
+                    f"{still_live.get('current_poll_id') if still_live else '<session gone>'!r})"
+                )
+    except Exception as e:
+        result.errors.append(f"user {victim}: {type(e).__name__}: {e}")
+    finally:
+        mod.LECTURE_SESSIONS.pop(victim, None)
+
+    # ── 4. Replayed/late answer for a poll from a session that already
+    # finished (e.g. a duplicate Telegram update arriving after the
+    # lecture's summary was already sent) ───────────────────────────────
+    try:
+        await run_full_lecture(mod, fake_bot, victim, year, module, subject, lecture_key)
+        last_poll_id = f"replay-of-a-finished-lecture-{victim}"
+        # Simulate a stray duplicate of the LAST real answer by re-sending
+        # its exact poll_id after the session is already gone.
+        before_completed = mod._get_entry(victim).get("lectures_completed", 0)
+        with capture_diagnostics() as diag:
+            await answer_poll(mod, ctx, victim, last_poll_id, 0)
+        result.diagnostics.extend(diag["lines"])
+        after_completed = mod._get_entry(victim).get("lectures_completed", 0)
+        if after_completed != before_completed:
+            result.violations.append(
+                f"user {victim}: replaying an answer after the lecture already finished changed "
+                f"lectures_completed ({before_completed} -> {after_completed}) — should have hit the "
+                f"'no session' fallback and done nothing"
+            )
+        if victim in mod.LECTURE_SESSIONS:
+            result.violations.append(f"user {victim}: a replayed post-finish answer resurrected a session")
+    except Exception as e:
+        result.errors.append(f"user {victim}: {type(e).__name__}: {e}")
+    finally:
+        mod.LECTURE_SESSIONS.pop(victim, None)
+
+    # ── 5. _user_locks growth — soft diagnostic, not a hard violation.
+    # Bounded by real distinct users who've ever answered a poll since
+    # the process started, not by request volume, so this is cheap even
+    # at real-world scale (thousands of students ≈ thousands of tiny
+    # Lock objects) — reported for visibility, not flagged as a bug.
+    if hasattr(mod, "_user_locks"):
+        for i in range(num_users):
+            await answer_poll(mod, ctx, base_user_id + 1000 + i, "irrelevant", 0)
+        result.diagnostics.append(
+            f"_user_locks holds {len(mod._user_locks)} entries after exercising {num_users} distinct "
+            f"user ids (informational only — this dict is never pruned, but is bounded by real distinct "
+            f"users, not by request volume)."
+        )
+
+    return result
+
+
+async def scenario_mistakes_bank_abuse(mod, fake_bot, base_user_id: int, num_users: int,
+                                        year: str, module: str, subject: str) -> CorrectnessResult:
+    """Mistakes-bank abuse: repeated-miss dedup under concurrent stress
+    (same user, same question, fired many times at once), many different
+    users concurrently missing the exact same question (checks
+    _MISTAKES_BY_USER doesn't cross-contaminate), a malformed entry
+    injected directly into MISTAKES_BANK (bypassing record_mistake
+    entirely, the way a bad restore or manual edit could), and a full
+    retake driven to completion afterward to make sure none of the above
+    left the bank in a state that crashes real usage."""
+    result = CorrectnessResult(runs=1)
+    ctx = make_fake_context(mod, fake_bot)
+    lecture_entry = mod.QUIZ_INDEX[year][f"{subject} Lecture 1"]
+    shared_mid = lecture_entry["ids"][0]
+    victim = base_user_id
+
+    # ── 1. Same user, same question, fired concurrently many times ──────
+    before_count = len(mod._MISTAKES_BY_USER.get(victim, []))
+    try:
+        with capture_diagnostics() as diag:
+            await asyncio.gather(*(
+                mod.record_mistake(victim, shared_mid, year, module, subject) for _ in range(25)
+            ))
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"user {victim}: {type(e).__name__}: {e}")
+    after_count = len(mod._MISTAKES_BY_USER.get(victim, []))
+    if after_count - before_count != 1:
+        result.violations.append(
+            f"user {victim}: 25 concurrent record_mistake() calls for the SAME question produced "
+            f"{after_count - before_count} bank entries, expected exactly 1 (dedup by user_id+mid+year "
+            f"should hold — see record_mistake's own docstring)"
+        )
+
+    # ── 2. Many DIFFERENT users concurrently missing the SAME question ──
+    other_users = [base_user_id + 1 + i for i in range(max(5, min(num_users, 40)))]
+    bank_len_before = len(mod.MISTAKES_BANK)
+    try:
+        with capture_diagnostics() as diag:
+            await asyncio.gather(*(
+                mod.record_mistake(u, shared_mid, year, module, subject) for u in other_users
+            ))
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"batch record_mistake: {type(e).__name__}: {e}")
+    bank_len_after = len(mod.MISTAKES_BANK)
+    if bank_len_after - bank_len_before != len(other_users):
+        result.violations.append(
+            f"{len(other_users)} different users concurrently missing the same question added "
+            f"{bank_len_after - bank_len_before} bank entries total, expected exactly {len(other_users)} "
+            f"(one each) — possible lost update or cross-user duplication under concurrency"
+        )
+    for u in other_users:
+        entries = mod._MISTAKES_BY_USER.get(u, [])
+        if len(entries) != 1 or entries[0].get("mid") != shared_mid:
+            result.violations.append(
+                f"user {u}: expected exactly 1 mistakes-bank entry for mid {shared_mid}, "
+                f"got {entries!r} — _MISTAKES_BY_USER may have cross-contaminated between users"
+            )
+
+    # ── 3. A malformed entry injected directly (missing required keys) —
+    # simulates a bad manual edit or a channel restore that let something
+    # through _clean_analytics_dict-style filtering ─────────────────────
+    malformed = {"user_id": victim, "mid": 999_999_999, "year": year}   # missing module + subject
+    mod.MISTAKES_BANK.append(malformed)
+    mod._mistakes_index_add(malformed)
+    try:
+        with capture_diagnostics() as diag:
+            await mod.start_mistakes_retake(ctx, victim)
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"user {victim}: start_mistakes_retake crashed on a malformed bank entry: {type(e).__name__}: {e}")
+    if malformed in mod.MISTAKES_BANK:
+        result.violations.append(
+            f"user {victim}: a malformed mistakes-bank entry (missing module/subject) survived "
+            f"start_mistakes_retake instead of being pruned by _resolve_mistake"
+        )
+    valid_entries_left = [m for m in mod._MISTAKES_BY_USER.get(victim, []) if mod._is_valid_mistake_entry(m)]
+    if not valid_entries_left and after_count > before_count:
+        result.violations.append(
+            f"user {victim}: the earlier valid mistake (mid {shared_mid}) disappeared after the "
+            f"malformed-entry retake attempt — pruning may be too aggressive"
+        )
+
+    # ── 4. Full retake driven to real completion, after all the abuse
+    # above, to make sure nothing above left the bank unusable ──────────
+    try:
+        with capture_diagnostics() as diag:
+            if victim in mod.MISTAKES_RETAKE_SESSIONS:
+                live = mod.MISTAKES_RETAKE_SESSIONS[victim]
+                sent = live.get("current_poll_id") is not None
+                while sent:
+                    poll_id, correct_opt = live["current_poll_id"], live["current_correct_id"]
+                    await answer_poll(mod, ctx, victim, poll_id, correct_opt)
+                    live = mod.MISTAKES_RETAKE_SESSIONS.get(victim)
+                    sent = live is not None and live.get("current_poll_id") is not None
+        result.diagnostics.extend(diag["lines"])
+    except Exception as e:
+        result.errors.append(f"user {victim}: retake-to-completion crashed: {type(e).__name__}: {e}")
+    if victim in mod.MISTAKES_RETAKE_SESSIONS:
+        result.violations.append(f"user {victim}: mistakes-retake session never finished after the abuse above")
+
+    # ── 5. Index/list consistency: every entry in _MISTAKES_BY_USER[victim]
+    # must be the SAME object present in MISTAKES_BANK, and vice versa ───
+    bank_ids_for_victim = {id(m) for m in mod.MISTAKES_BANK if m.get("user_id") == victim}
+    index_ids_for_victim = {id(m) for m in mod._MISTAKES_BY_USER.get(victim, [])}
+    if bank_ids_for_victim != index_ids_for_victim:
+        result.violations.append(
+            f"user {victim}: _MISTAKES_BY_USER and MISTAKES_BANK disagree on this user's entries after "
+            f"the abuse above (index has {len(index_ids_for_victim)}, bank has {len(bank_ids_for_victim)}) "
+            f"— the derived index has drifted from its source of truth"
+        )
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 6 — scenario runners + reporting
+# ─────────────────────────────────────────────────────────────────
+PERF_SCENARIOS = {"poll_answer", "daily_quiz"}
+CORRECTNESS_SCENARIOS = {"full_lecture", "full_daily_quiz", "achievements", "race", "sessions"}
+ABUSE_SCENARIOS = {"session_abuse", "mistakes_bank_abuse"}
+
+
+async def run_perf_scenario(mod, fake_bot, scenario: str, num_users: int, year, module, subject) -> RunResult:
     result = RunResult()
     base_user_id = 900_000_000  # far outside any real Telegram user id range
 
@@ -453,6 +1438,49 @@ async def run_scenario(mod, fake_bot, scenario: str, num_users: int, year, modul
     return result
 
 
+async def run_correctness_scenario(mod, fake_bot, scenario: str, num_users: int, year, module, subject,
+                                    num_lectures: int) -> CorrectnessResult:
+    combined = CorrectnessResult()
+    base_user_id = 910_000_000  # separate id range from perf scenarios, so runs never collide
+
+    async def _one(i):
+        user_id = base_user_id + i
+        if scenario == "full_lecture":
+            return await scenario_full_lecture(mod, fake_bot, user_id, year, module, subject)
+        elif scenario == "full_daily_quiz":
+            return await scenario_full_daily_quiz(mod, fake_bot, user_id)
+        elif scenario == "achievements":
+            return await scenario_achievements(mod, fake_bot, user_id, year, module, subject, num_lectures)
+        elif scenario == "race":
+            return await scenario_same_user_race(mod, fake_bot, user_id, year, module, subject)
+        elif scenario == "sessions":
+            return await scenario_session_persistence(mod, fake_bot, user_id, year, module, subject)
+        else:
+            raise ValueError(scenario)
+
+    per_user_results = await asyncio.gather(*(_one(i) for i in range(num_users)))
+    for r in per_user_results:
+        combined.violations.extend(r.violations)
+        combined.diagnostics.extend(r.diagnostics)
+        combined.errors.extend(r.errors)
+        combined.runs += r.runs
+    return combined
+
+
+async def run_abuse_scenario(mod, fake_bot, scenario: str, num_users: int, year, module, subject) -> CorrectnessResult:
+    """Abuse scenarios run ONCE per invocation (not once per simulated
+    user) — num_users controls how many attacker/user identities the
+    abuse pattern itself uses internally. Uses its own user-id range so
+    it never collides with perf or correctness scenarios' fake users."""
+    base_user_id = 920_000_000
+    if scenario == "session_abuse":
+        return await scenario_session_abuse(mod, fake_bot, base_user_id, num_users, year, module, subject)
+    elif scenario == "mistakes_bank_abuse":
+        return await scenario_mistakes_bank_abuse(mod, fake_bot, base_user_id, num_users, year, module, subject)
+    else:
+        raise ValueError(scenario)
+
+
 def percentile(data: list, pct: float) -> float:
     if not data:
         return float("nan")
@@ -464,10 +1492,10 @@ def percentile(data: list, pct: float) -> float:
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-def print_report(scenario: str, num_users: int, result: RunResult, fake_bot: FakeBot):
+def print_perf_report(scenario: str, num_users: int, result: RunResult, fake_bot: FakeBot):
     lat = result.latencies_ms
     print(f"\n{'=' * 60}")
-    print(f"  Scenario: {scenario}   Simulated concurrent users: {num_users}")
+    print(f"  [PERF] Scenario: {scenario}   Simulated concurrent users: {num_users}")
     print(f"{'=' * 60}")
     if result.errors:
         print(f"  ⚠️  {len(result.errors)}/{num_users} runs raised an error:")
@@ -488,15 +1516,71 @@ def print_report(scenario: str, num_users: int, result: RunResult, fake_bot: Fak
     print(f"{'=' * 60}\n")
 
 
+def print_correctness_report(scenario: str, num_users: int, result: CorrectnessResult):
+    print(f"\n{'=' * 60}")
+    status = "✅ PASS" if result.ok else "❌ FAIL"
+    print(f"  [CORRECTNESS] Scenario: {scenario}   Users: {num_users}   {status}")
+    print(f"{'=' * 60}")
+    print(f"  Runs completed: {result.runs}/{num_users}")
+    if result.errors:
+        print(f"  ⚠️  {len(result.errors)} uncaught exception(s):")
+        for e in result.errors[:10]:
+            print(f"      - {e}")
+        if len(result.errors) > 10:
+            print(f"      ... and {len(result.errors) - 10} more")
+    if result.violations:
+        print(f"  ❌ {len(result.violations)} invariant violation(s):")
+        for v in result.violations[:20]:
+            print(f"      - {v}")
+        if len(result.violations) > 20:
+            print(f"      ... and {len(result.violations) - 20} more")
+    if result.diagnostics:
+        seen = set()
+        unique = [d for d in result.diagnostics if not (d in seen or seen.add(d))]
+        print(f"  📋 {len(unique)} distinct printed diagnostic(s) captured "
+              f"(the bot printed these itself — some may be expected, worth a skim):")
+        for d in unique[:15]:
+            print(f"      - {d}")
+        if len(unique) > 15:
+            print(f"      ... and {len(unique) - 15} more distinct line(s)")
+    if result.ok and not result.diagnostics:
+        print("  Nothing to report — all invariants held, no errors, no suspicious prints.")
+    print(f"{'=' * 60}\n")
+
+
 # ─────────────────────────────────────────────────────────────────
-# STEP 6 — CLI
+# STEP 7 — CLI
 # ─────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--bot-path", default="bot.py", help="Path to your bot.py (default: ./bot.py)")
-    parser.add_argument("--scenario", choices=["poll_answer", "daily_quiz", "both"], default="both")
+    parser.add_argument(
+        "--scenario",
+        choices=["poll_answer", "daily_quiz", "full_lecture", "full_daily_quiz",
+                 "achievements", "race", "sessions", "session_abuse", "mistakes_bank_abuse",
+                 "perf", "correctness", "abuse", "both", "all"],
+        default="all",
+        help="'perf'/'both' = the two latency scenarios; 'correctness' = the per-user "
+             "correctness scenarios; 'abuse' = the session/mistakes-bank abuse scenarios; "
+             "'all' (default) = literally everything.",
+    )
     parser.add_argument("--users", type=int, nargs="+", default=[100, 300, 500, 700],
-                         help="One or more concurrent-user counts to test, e.g. --users 100 500 700")
+                         help="One or more concurrent-user counts for PERF scenarios, "
+                              "e.g. --users 100 500 700. Correctness/abuse scenarios use "
+                              "--correctness-users/--abuse-users instead (usually much smaller).")
+    parser.add_argument("--correctness-users", type=int, default=50,
+                         help="Concurrent simulated users for correctness scenarios "
+                              "(default 50 — these are about behavior, not raw scale, "
+                              "so this rarely needs to be large; a moderate number is "
+                              "still worth using so cross-user interference bugs, if any, "
+                              "have a chance to show up).")
+    parser.add_argument("--abuse-users", type=int, default=30,
+                         help="How many attacker/user identities each abuse scenario uses "
+                              "internally (default 30) — e.g. how many different fake users "
+                              "concurrently miss the same mistakes-bank question, or the "
+                              "fanout of a duplicate-tap spam burst. Each abuse scenario runs "
+                              "ONCE per invocation regardless of this number — it shapes the "
+                              "abuse pattern, not a repeat count.")
     parser.add_argument("--fake-latency-ms", type=float, default=0.0,
                          help="Simulated per-Telegram-call network delay, in ms. "
                               "0 (default) isolates pure code latency. Try 50-150 "
@@ -504,6 +1588,12 @@ def main():
                               "that compounds under concurrency.")
     parser.add_argument("--lectures", type=int, default=5, help="Fake lectures to seed (default 5)")
     parser.add_argument("--questions-per-lecture", type=int, default=10)
+    parser.add_argument("--achievements-lectures", type=int, default=15,
+                         help="How many of the seeded lectures the 'achievements' scenario "
+                              "runs per user (default 15) — needs enough total questions "
+                              "(this × --questions-per-lecture) to clear ACHIEVEMENTS' "
+                              "first-tier thresholds, or it'll flag nothing-unlocked as a "
+                              "violation. Raise --lectures to seed more if needed.")
     args = parser.parse_args()
 
     if not os.path.exists(args.bot_path):
@@ -517,13 +1607,45 @@ def main():
 
     year, module, subject = seed_fake_data(mod, args.lectures, args.questions_per_lecture)
 
-    scenarios = ["poll_answer", "daily_quiz"] if args.scenario == "both" else [args.scenario]
+    if args.scenario in ("perf", "both"):
+        scenarios = list(PERF_SCENARIOS)
+    elif args.scenario == "correctness":
+        scenarios = list(CORRECTNESS_SCENARIOS)
+    elif args.scenario == "abuse":
+        scenarios = list(ABUSE_SCENARIOS)
+    elif args.scenario == "all":
+        scenarios = list(PERF_SCENARIOS) + list(CORRECTNESS_SCENARIOS) + list(ABUSE_SCENARIOS)
+    else:
+        scenarios = [args.scenario]
+
+    any_correctness_failed = False
 
     for scenario in scenarios:
-        for n in args.users:
+        if scenario in PERF_SCENARIOS:
+            for n in args.users:
+                fake_bot.call_counts.clear()
+                result = asyncio.run(run_perf_scenario(mod, fake_bot, scenario, n, year, module, subject))
+                print_perf_report(scenario, n, result, fake_bot)
+        elif scenario in ABUSE_SCENARIOS:
             fake_bot.call_counts.clear()
-            result = asyncio.run(run_scenario(mod, fake_bot, scenario, n, year, module, subject))
-            print_report(scenario, n, result, fake_bot)
+            result = asyncio.run(run_abuse_scenario(
+                mod, fake_bot, scenario, args.abuse_users, year, module, subject,
+            ))
+            print_correctness_report(scenario, args.abuse_users, result)
+            if not result.ok:
+                any_correctness_failed = True
+        else:
+            fake_bot.call_counts.clear()
+            result = asyncio.run(run_correctness_scenario(
+                mod, fake_bot, scenario, args.correctness_users, year, module, subject,
+                args.achievements_lectures,
+            ))
+            print_correctness_report(scenario, args.correctness_users, result)
+            if not result.ok:
+                any_correctness_failed = True
+
+    if scenarios and any(s in CORRECTNESS_SCENARIOS or s in ABUSE_SCENARIOS for s in scenarios):
+        sys.exit(1 if any_correctness_failed else 0)
 
 
 if __name__ == "__main__":
@@ -533,6 +1655,8 @@ if __name__ == "__main__":
 # ═══════════════════════════════════════════════════════════════════════
 # READING THE RESULTS
 # ═══════════════════════════════════════════════════════════════════════
+#
+# PERF scenarios (poll_answer, daily_quiz):
 #
 # p50 = typical user's experience. p95 = the experience of the unluckiest
 # 1-in-20 users at that concurrency level — this is usually the number
@@ -547,19 +1671,44 @@ if __name__ == "__main__":
 #
 #   - SUPER-linear growth (p95 quadruples when users doubles, or a cliff
 #     appears at some threshold): there's likely still a hidden O(n)-ish
-#     bottleneck somewhere in that scenario's path, the same shape as the
-#     poll_status_by_mid / daily_quiz_subject_pool bugs already found and
-#     fixed earlier — worth profiling further rather than just adding
-#     more vCPU, since more CPU won't fix an algorithmic bottleneck, only
-#     delay when it becomes visible.
+#     bottleneck somewhere in that scenario's path — worth profiling
+#     further rather than just adding more vCPU, since more CPU won't
+#     fix an algorithmic bottleneck, only delay when it becomes visible.
 #
 #   - Errors appearing only at higher concurrency (not at low counts):
 #     usually a race condition on shared in-memory state. Check whether
 #     the function under test is missing an @_serialize_per_user-style
 #     guard, or two users are mutating the same dict without one waiting
-#     for the other.
+#     for the other — the "race" correctness scenario below tests exactly
+#     this for the one guard that already exists; a NEW hot path without
+#     that guard would show up here as errors or (worse, silently) as an
+#     invariant violation in the correctness scenarios instead.
 #
-# What this DOESN'T tell you:
+# CORRECTNESS scenarios (full_lecture, full_daily_quiz, achievements,
+# race, sessions):
+#
+#   - PASS means every invariant this script knows how to check held —
+#     it does NOT mean "this bot has no bugs," only "no bug in the
+#     specific things checked." Read the printed diagnostics even on a
+#     PASS; they're not failures, but they're worth a skim.
+#
+#   - A violation naming a specific achievement category almost always
+#     points at either: (a) the seeded volume being too low to clear
+#     that category's tier-1 threshold (raise --lectures /
+#     --questions-per-lecture / --achievements-lectures), or (b) an
+#     actual bug in _check_achievements / ACHIEVEMENT_STAT_FIELD /
+#     the call site that should have triggered it.
+#
+#   - A "race" scenario failure means @_serialize_per_user (or whatever
+#     replaced it) is no longer preventing a double-tap from double-
+#     counting — treat this as high-severity, since it means XP/streak
+#     numbers become unreliable under real concurrent load, not just in
+#     this synthetic test.
+#
+#   - A "sessions" scenario skip (not failure) just means the bot.py you
+#     pointed this at doesn't have the SESSION PERSISTENCE feature yet.
+#
+# What this DOESN'T tell you (either kind of scenario):
 #
 #   - Real Telegram API latency or rate-limit behavior (AIORateLimiter
 #     is real code but was never exercised here since FakeBot bypasses
@@ -568,10 +1717,13 @@ if __name__ == "__main__":
 #   - Railway's actual CPU/memory ceiling at your current plan — this
 #     tells you how your CODE scales, which combined with Railway's
 #     metrics (CPU % during a real run, from Railway's own dashboard)
-#     lets you decide when to size up. Run this script, watch where p95
-#     starts climbing sharply, then cross-reference with Railway's CPU
-#     graph during a comparable real traffic burst if you want to map
-#     "code latency" to "the vCPU number Railway shows using."
+#     lets you decide when to size up.
 #   - Disk I/O contention exactly as Railway's filesystem would behave —
 #     _atomic_write_json's fsync cost depends on the underlying storage,
 #     which will differ between your local machine and Railway's volumes.
+#   - Cross-user interference bugs that only manifest with real Telegram
+#     user IDs, real timing jitter, or real network retries — this script
+#     controls timing precisely (everything is either instant or a fixed
+#     --fake-latency-ms), which is great for isolating your code's own
+#     behavior but won't reproduce bugs that only need real-world jitter
+#     to trigger.
