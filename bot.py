@@ -1385,10 +1385,45 @@ SETTINGS: dict = load_settings()
 # source of truth — no separate state file needed.
 _settings_backup_msg_id: int | None = None
 
-# Same debounce pattern as analytics — local save_settings() always
-# happens immediately; only the channel mirror is throttled.
+# Channel mirror debounce — separate from the local-disk debounce below.
 _last_settings_backup_at: float = 0.0
 SETTINGS_BACKUP_MIN_INTERVAL = 30  # seconds
+
+# ── Local-disk debounce for the hot settings paths ────────────────
+# save_settings() itself (deepcopy + atomic write of EVERY user's settings,
+# not just the one who triggered it) is still called directly — and
+# immediately — from low-frequency, explicit single-user actions (a
+# settings toggle, a nickname change, a ban/unban, a channel restore):
+# those want the file on disk correct right away and don't fire often
+# enough for the cost to matter.
+#
+# start_daily_quiz is different: every one of the day's Daily Quiz taps
+# (hundreds of users within the same push window) used to pay for a full
+# SETTINGS file rewrite just to persist that one user's
+# daily_quiz_last_date. That call site now calls _mark_settings_dirty()
+# instead — an O(1) flag set, no I/O — and a periodic job
+# (_flush_settings_job, registered in _post_init) does the real save every
+# SETTINGS_FLUSH_INTERVAL seconds if anything changed. Same accepted
+# data-loss window as analytics: a hard crash between flushes can lose up
+# to one interval's worth of "already did today's Daily Quiz" gates, which
+# just means an affected user could see the Daily Quiz prompt again after
+# a crash-restart — not a correctness problem worth an fsync per tap.
+_settings_dirty: bool = False
+SETTINGS_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_settings_dirty() -> None:
+    global _settings_dirty
+    _settings_dirty = True
+
+async def _flush_settings_if_dirty() -> None:
+    """Writes SETTINGS to disk only if something changed since the last
+    flush. Called by the periodic job and by _post_shutdown for a final
+    flush on clean exit."""
+    global _settings_dirty
+    if not _settings_dirty:
+        return
+    _settings_dirty = False
+    await save_settings()
 
 def _get_settings_entry(user_id: int) -> dict:
     key   = str(user_id)
@@ -1836,10 +1871,43 @@ _reindex_mistakes_bank()
 # restore_mistakes_bank_from_channel; the pin is the source of truth.
 _mistakes_bank_backup_msg_id: int | None = None
 
-# Same debounce pattern as lecture results — local save always happens
-# immediately; only the channel mirror is throttled.
+# Channel mirror debounce — separate from the local-disk debounce below.
 _last_mistakes_bank_backup_at: float = 0.0
 MISTAKES_BANK_BACKUP_MIN_INTERVAL = 30  # seconds
+
+# ── Local-disk debounce for the hot mistakes-bank path ─────────────
+# save_mistakes_bank() (deepcopy + atomic write of EVERY user's mistakes,
+# not just the one entry that just got added) is still called directly —
+# and immediately — from low-frequency paths: a channel restore, an admin
+# clearing a user's bank, or pruning a stale/malformed entry (see
+# _resolve_mistake) — those are rare enough, or want disk correct right
+# away, that the cost doesn't matter.
+#
+# record_mistake is different: it fires on every wrong answer, from every
+# active user, all day — the single hottest write path into this file.
+# Same fix as analytics/settings: mark dirty (O(1), no I/O) and let a
+# periodic job (_flush_mistakes_bank_job, registered in _post_init) do the
+# real save every MISTAKES_BANK_FLUSH_INTERVAL seconds if anything
+# changed. Worst case on a hard crash: up to one interval's worth of
+# recently-missed questions aren't in the bank yet — they just don't seed
+# that user's Mistakes Bank slice until missed again, not a correctness
+# problem worth an fsync per wrong answer.
+_mistakes_bank_dirty: bool = False
+MISTAKES_BANK_FLUSH_INTERVAL = 60  # seconds
+
+def _mark_mistakes_bank_dirty() -> None:
+    global _mistakes_bank_dirty
+    _mistakes_bank_dirty = True
+
+async def _flush_mistakes_bank_if_dirty() -> None:
+    """Writes MISTAKES_BANK to disk only if something changed since the
+    last flush. Called by the periodic job and by _post_shutdown for a
+    final flush on clean exit."""
+    global _mistakes_bank_dirty
+    if not _mistakes_bank_dirty:
+        return
+    _mistakes_bank_dirty = False
+    await save_mistakes_bank()
 
 async def record_mistake(user_id: int, mid: int, year: str, module: str, subject: str) -> bool:
     """Adds a wrong-answer REFERENCE to the bank — just the question id
@@ -1855,7 +1923,7 @@ async def record_mistake(user_id: int, mid: int, year: str, module: str, subject
     entry = {"user_id": user_id, "mid": mid, "year": year, "module": module, "subject": subject}
     MISTAKES_BANK.append(entry)
     _mistakes_index_add(entry)
-    await save_mistakes_bank()
+    _mark_mistakes_bank_dirty()
     return True
 
 async def backup_mistakes_bank_to_channel(context):
@@ -2234,6 +2302,14 @@ async def _resolve_mistakes(context: ContextTypes.DEFAULT_TYPE, entries: list) -
 _DAILY_QUIZ_QUESTIONS_DATE: str | None = None
 _DAILY_QUIZ_QUESTIONS: dict[str, list] = {}   # year -> [question dict, ...] (up to DAILY_QUIZ_TOTAL_COUNT)
 
+# One lock per year, created lazily via setdefault (sync, no await in between
+# check and creation, so this is safe despite concurrent_updates()). Without
+# it, every one of the day's first N concurrent Daily Quiz requests for a
+# year sees `year not in _DAILY_QUIZ_QUESTIONS` before any of them finishes
+# building, so all N pay the full build cost instead of 1 build + (N-1)
+# cheap cache reads.
+_DAILY_QUIZ_BUILD_LOCKS: dict[str, asyncio.Lock] = {}
+
 def _ensure_daily_quiz_questions_fresh() -> None:
     """Call before any read of _DAILY_QUIZ_QUESTIONS. Clears every year's
     cached questions the first time it's called on a new day, so the
@@ -2279,13 +2355,22 @@ async def get_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str
     caching them on first request of the day."""
     _ensure_daily_quiz_questions_fresh()
     if year not in _DAILY_QUIZ_QUESTIONS:
-        _DAILY_QUIZ_QUESTIONS[year] = await _build_daily_quiz_questions(context, year)
-        # Persist right away rather than waiting for the next periodic
-        # sessions tick — this is the one moment (first build of the day
-        # for this year) a redeploy landing seconds later would otherwise
-        # regenerate a different set. See SESSION PERSISTENCE below.
-        await _flush_sessions_if_changed()
-        await backup_sessions_to_channel(context)
+        # Double-checked locking: the cheap path above (699 reads) never
+        # touches the lock at all. Only a genuine cache miss pays for the
+        # lock acquire, and only the first miss for this year pays for the
+        # build — everyone else queued behind the lock re-checks the cache
+        # (now warm) and returns immediately instead of building again.
+        lock = _DAILY_QUIZ_BUILD_LOCKS.setdefault(year, asyncio.Lock())
+        async with lock:
+            _ensure_daily_quiz_questions_fresh()  # guards against the day rolling over mid-wait
+            if year not in _DAILY_QUIZ_QUESTIONS:
+                _DAILY_QUIZ_QUESTIONS[year] = await _build_daily_quiz_questions(context, year)
+                # Persist right away rather than waiting for the next periodic
+                # sessions tick — this is the one moment (first build of the day
+                # for this year) a redeploy landing seconds later would otherwise
+                # regenerate a different set. See SESSION PERSISTENCE below.
+                await _flush_sessions_if_changed()
+                await backup_sessions_to_channel(context)
     return _DAILY_QUIZ_QUESTIONS[year]
 
 async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_id: int, session: dict) -> bool:
@@ -2550,7 +2635,12 @@ async def start_daily_quiz(context: ContextTypes.DEFAULT_TYPE, user_id: int, mes
 
     entry = _get_settings_entry(user_id)
     entry["daily_quiz_last_date"] = today
-    await save_settings()
+    # Hot path (every Daily Quiz start, from every user) — defer the full
+    # SETTINGS file rewrite to the periodic flush instead of paying for one
+    # on every single tap. See _mark_settings_dirty above. The channel
+    # mirror call below is cheap regardless: it's already throttled to
+    # SETTINGS_BACKUP_MIN_INTERVAL and no-ops on most calls.
+    _mark_settings_dirty()
     await backup_settings_to_channel(context)
 
     session = {
@@ -3526,22 +3616,38 @@ def load_sessions() -> dict | None:
 
 _sessions_backup_msg_id: int | None = None
 _last_sessions_backup_at: float = 0.0
+_last_sessions_backup_snapshot_json: str | None = None   # what was last actually uploaded — separate
+                                                           # from _last_sessions_snapshot_json (local-disk
+                                                           # flush's own change-detection), since the two
+                                                           # run on different schedules/call sites
 
-async def backup_sessions_to_channel(context) -> None:
+async def backup_sessions_to_channel(context, force: bool = False) -> None:
     """Same shape as every other backup_*_to_channel, but throttled AND —
     unlike the others — deletes the previous pinned backup instead of
-    keeping it forever. See the section banner above for why."""
-    global _sessions_backup_msg_id, _last_sessions_backup_at
+    keeping it forever. See the section banner above for why.
+
+    Also skips the upload entirely when the snapshot is identical to the
+    last one actually sent — most ticks land between quizzes with nobody
+    mid-session, so this turns "upload every ~30s no matter what" into
+    "upload only when session state actually moved." force=True bypasses
+    both this check and the throttle; used by the reconcile job, which
+    calls this specifically because the channel's pin is missing or wrong
+    and needs a fresh upload regardless of whether anything changed."""
+    global _sessions_backup_msg_id, _last_sessions_backup_at, _last_sessions_backup_snapshot_json
     if not SESSIONS_GROUP_ID:
         return
     if not RESTORE_OK.get("sessions", True):
         print("SESSIONS BACKUP SKIPPED — last restore failed, refusing to overwrite the channel backup.")
         return
     now = time.monotonic()
-    if now - _last_sessions_backup_at < SESSIONS_BACKUP_MIN_INTERVAL:
+    if not force and now - _last_sessions_backup_at < SESSIONS_BACKUP_MIN_INTERVAL:
         return
+    snapshot = _sessions_snapshot()
+    as_json  = json.dumps(snapshot, sort_keys=True)
+    if not force and as_json == _last_sessions_backup_snapshot_json:
+        return   # nothing changed since the last successful upload
     _last_sessions_backup_at = now
-    data = json.dumps(_sessions_snapshot(), indent=2, ensure_ascii=False).encode("utf-8")
+    data = json.dumps(snapshot, indent=2, ensure_ascii=False).encode("utf-8")
     try:
         sent = await context.bot.send_document(
             chat_id=SESSIONS_GROUP_ID,
@@ -3557,6 +3663,7 @@ async def backup_sessions_to_channel(context) -> None:
         )
     except Exception as e:
         print("SESSIONS PIN ERROR:", e)
+    _last_sessions_backup_snapshot_json = as_json
     old_msg_id = _sessions_backup_msg_id
     _sessions_backup_msg_id = sent.message_id
     if old_msg_id and old_msg_id != sent.message_id:
@@ -3571,7 +3678,7 @@ async def restore_sessions_from_channel(app) -> None:
         return
 
     async def _do():
-        global _sessions_backup_msg_id
+        global _sessions_backup_msg_id, _last_sessions_backup_snapshot_json
         chat   = await app.bot.get_chat(SESSIONS_GROUP_ID)
         pinned = chat.pinned_message
         if not pinned or not pinned.document or (pinned.caption or "") != SESSIONS_BACKUP_MARKER:
@@ -3581,6 +3688,7 @@ async def restore_sessions_from_channel(app) -> None:
         restored = json.loads(bytes(raw).decode("utf-8"))
         _restore_sessions_dict(restored)
         await _flush_sessions_if_changed()
+        _last_sessions_backup_snapshot_json = json.dumps(_sessions_snapshot(), sort_keys=True)
         _sessions_backup_msg_id = pinned.message_id
 
     await _run_restore_with_retries(app, "sessions", "Sessions", _do)
@@ -8016,13 +8124,14 @@ async def _post_init(app):
     if app.job_queue is None:
         print(
             "⚠️ No JobQueue available — periodic backup reconciliation, the "
-            "analytics flush, stale-session cleanup, session persistence, "
-            "the Daily Quiz push, the hourly Zikr reminder, and the daily "
-            "zipped backup export are disabled. Local analytics from poll "
-            "answers will only hit "
+            "analytics/settings/mistakes-bank flushes, stale-session cleanup, "
+            "session persistence, the Daily Quiz push, the hourly Zikr "
+            "reminder, and the daily zipped backup export are disabled. "
+            "Local analytics/settings/mistakes-bank changes from hot paths "
+            "(poll answers, Daily Quiz starts, wrong answers) will only hit "
             "disk on the next immediate-save call site "
-            "(restore/reset/import) or on a clean shutdown, not every 60s. "
-            "Install with: pip install \"python-telegram-bot[job-queue]\""
+            "(restore/reset/import/toggle) or on a clean shutdown, not every "
+            "60s. Install with: pip install \"python-telegram-bot[job-queue]\""
         )
     else:
         app.job_queue.run_repeating(
@@ -8030,6 +8139,12 @@ async def _post_init(app):
         )
         app.job_queue.run_repeating(
             _flush_analytics_job, interval=ANALYTICS_FLUSH_INTERVAL, first=ANALYTICS_FLUSH_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _flush_settings_job, interval=SETTINGS_FLUSH_INTERVAL, first=SETTINGS_FLUSH_INTERVAL,
+        )
+        app.job_queue.run_repeating(
+            _flush_mistakes_bank_job, interval=MISTAKES_BANK_FLUSH_INTERVAL, first=MISTAKES_BANK_FLUSH_INTERVAL,
         )
         app.job_queue.run_repeating(
             _cleanup_stale_sessions_job, interval=STALE_SESSION_CHECK_INTERVAL, first=STALE_SESSION_CHECK_INTERVAL,
@@ -8056,6 +8171,18 @@ async def _flush_analytics_job(context: ContextTypes.DEFAULT_TYPE):
     _analytics_dirty: writes analytics.json only if a poll answer marked it
     dirty since the last tick. No-ops (no deepcopy, no I/O) on a quiet tick."""
     await _flush_analytics_if_dirty()
+
+async def _flush_settings_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _settings_dirty: writes settings.json only if a Daily Quiz start (or
+    other dirty-marking call site) changed it since the last tick."""
+    await _flush_settings_if_dirty()
+
+async def _flush_mistakes_bank_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic tick for the hot-path debounce described above
+    _mistakes_bank_dirty: writes mistakes_bank.json only if a wrong answer
+    (record_mistake) changed it since the last tick."""
+    await _flush_mistakes_bank_if_dirty()
 
 # ═══════════════════════════════════════════════════════════════
 # STALE SESSION CLEANUP — a student who leaves mid-lecture (closes the
@@ -8126,6 +8253,8 @@ async def _post_shutdown(app):
     normal restart/redeploy never loses data. Only a hard crash (killed
     process, power loss) can still lose that window; a clean stop cannot."""
     await _flush_analytics_if_dirty()
+    await _flush_settings_if_dirty()
+    await _flush_mistakes_bank_if_dirty()
     await _flush_sessions_if_changed()
 
 # ── Backup reconciliation ────────────────────────────────────────
@@ -8159,7 +8288,11 @@ async def _reconcile_backups_job(context: ContextTypes.DEFAULT_TYPE):
         ("lecture_results", LECTURE_RESULTS_GROUP_ID, LECTURE_RESULTS_BACKUP_MARKER, backup_lecture_results_to_channel),
         ("mistakes_bank",   MISTAKES_BANK_GROUP_ID,   MISTAKES_BANK_BACKUP_MARKER,   backup_mistakes_bank_to_channel),
         ("storage",         STORAGE_GROUP_ID,         STORAGE_BACKUP_MARKER,         backup_storage_to_channel),
-        ("sessions",        SESSIONS_GROUP_ID,        SESSIONS_BACKUP_MARKER,        backup_sessions_to_channel),
+        # force=True: the pin being out of sync is exactly why we're here —
+        # skip both backup_sessions_to_channel's throttle and its
+        # unchanged-content skip so the re-upload actually happens.
+        ("sessions",        SESSIONS_GROUP_ID,        SESSIONS_BACKUP_MARKER,
+         (lambda ctx: backup_sessions_to_channel(ctx, force=True))),
     ]
     # One quiz check per configured year, each hitting its own channel.
     for y in configured_years():
