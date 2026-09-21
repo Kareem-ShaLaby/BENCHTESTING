@@ -2381,9 +2381,9 @@ _DAILY_QUIZ_POOL_CACHE_TTL_SECONDS = 120
 # admin can also temporarily override a given year via /daily_module
 # (see get_daily_quiz_scope), which takes priority over this default.
 DAILY_QUIZ_ACTIVE_MODULE = {
-    "y1": "Foundation (2)",
-    "y2": "Blood",
-    "y3": "Genitourinary",
+    "y1": "Foundation (1)",
+    "y2": "Respiratory",
+    "y3": "Endocrine",
 }
 
 # Rebuilding this pool means: for every (module, subject) pair, scanning
