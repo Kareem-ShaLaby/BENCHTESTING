@@ -883,8 +883,12 @@ def _clean_analytics_dict(raw: dict) -> dict:
 
 def load_analytics() -> dict:
     if os.path.exists(ANALYTICS_FILE):
-        with open(ANALYTICS_FILE) as f:
-            raw = json.load(f)
+        try:
+            with open(ANALYTICS_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            print(f"ANALYTICS: couldn't load {ANALYTICS_FILE} ({type(e).__name__}: {e}) — using empty default.")
+            return {}
         return _clean_analytics_dict(raw)
     return {}
 
@@ -1565,8 +1569,12 @@ def _blank_settings_entry() -> dict:
 
 def load_settings() -> dict:
     if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            print(f"SETTINGS: couldn't load {SETTINGS_FILE} ({type(e).__name__}: {e}) — using empty default.")
+            return {}
     return {}
 
 async def save_settings():
@@ -2063,8 +2071,12 @@ def load_mistakes_bank() -> list:
     well-formed entry without each needing its own defensive check."""
     if not os.path.exists(MISTAKES_BANK_FILE):
         return []
-    with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
-        raw = json.load(f)
+    try:
+        with open(MISTAKES_BANK_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        print(f"MISTAKES BANK: couldn't load {MISTAKES_BANK_FILE} ({type(e).__name__}: {e}) — using empty default.")
+        return []
     required = ("user_id", "mid", "year", "module", "subject")
     clean  = [m for m in raw if isinstance(m, dict) and all(k in m for k in required)]
     if len(clean) != len(raw):
@@ -2747,6 +2759,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
     if not session["queue"]:
         session["current_poll_id"] = None
         session["current_correct_id"] = None
+        session["current_option_count"] = None
         session["current_message_id"] = None
         session["current_delivered_at"] = None
         return False
@@ -2766,6 +2779,7 @@ async def _deliver_next_daily_question(context: ContextTypes.DEFAULT_TYPE, user_
         return await _deliver_next_daily_question(context, user_id, session)   # try the next one
     session["current_poll_id"]    = msg.poll.id
     session["current_correct_id"] = q["correct_option_id"]
+    session["current_option_count"] = len(q.get("options") or [])
     session["current_message_id"] = msg.message_id
     session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
     # q was popped off the queue above, so stash its module/subject on the
@@ -4095,8 +4109,12 @@ def _restore_sessions_dict(raw: dict) -> None:
 
 def load_sessions() -> dict | None:
     if os.path.exists(SESSIONS_FILE):
-        with open(SESSIONS_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(SESSIONS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            print(f"SESSIONS: couldn't load {SESSIONS_FILE} ({type(e).__name__}: {e}) — using empty default.")
+            return {}
     return None
 
 _sessions_backup_msg_id: int | None = None
@@ -5131,6 +5149,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
         session["current_poll_id"]    = msg.poll.id
         session["current_correct_id"] = correct_id
+        session["current_option_count"] = len(options)
         session["current_message_id"] = msg.message_id
         session["current_mid"]        = mid
         session["current_delivered_at"] = time.time()  # see _record_time_spent / year leaderboard
@@ -5139,6 +5158,7 @@ async def _deliver_next_lecture_question(context: ContextTypes.DEFAULT_TYPE, use
 
     session["current_poll_id"]    = None
     session["current_correct_id"] = None
+    session["current_option_count"] = None
     session["current_message_id"] = None
     session["current_mid"]        = None
     session["current_delivered_at"] = None
@@ -5170,6 +5190,25 @@ async def _deliver_all_lecture_questions(context: ContextTypes.DEFAULT_TYPE, use
     session["current_mid"]        = None
     return sent_count
 
+def _validated_option_id(answer, option_count: int | None = None) -> int | None:
+    """Return the single valid option index from a Telegram PollAnswer.
+
+    Telegram sends an empty option_ids list when a user retracts an answer.
+    Treat that, negative indices, non-integer values, multiple selections, and
+    indices outside the actual poll's option range as non-answers so they cannot
+    advance a session or increment analytics.
+    """
+    option_ids = getattr(answer, "option_ids", None)
+    if not isinstance(option_ids, (list, tuple)) or len(option_ids) != 1:
+        return None
+    chosen = option_ids[0]
+    if isinstance(chosen, bool) or not isinstance(chosen, int) or chosen < 0:
+        return None
+    if option_count is not None and chosen >= option_count:
+        return None
+    return chosen
+
+
 @_serialize_per_user
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fires when a user answers a poll the bot sent (our lecture-delivery
@@ -5185,9 +5224,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     daily_session = DAILY_QUIZ_SESSIONS.get(user_id)
     if daily_session and daily_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, daily_session.get("current_option_count"))
+        if chosen is None:
+            return
         daily_session["timeout_streak"] = 0
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == daily_session.get("current_correct_id")
+        is_correct = chosen == daily_session.get("current_correct_id")
         await _advance_daily_quiz_session(
             context, user_id, daily_session, is_correct, daily_session.get("current_message_id"),
             daily_session.get("current_delivered_at"),
@@ -5196,9 +5237,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     retake_session = MISTAKES_RETAKE_SESSIONS.get(user_id)
     if retake_session and retake_session.get("current_poll_id") == poll_id:
+        chosen = _validated_option_id(answer, retake_session.get("current_option_count"))
+        if chosen is None:
+            return
         retake_session["timeout_streak"] = 0
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == retake_session.get("current_correct_id")
+        is_correct = chosen == retake_session.get("current_correct_id")
         await _advance_mistakes_retake_session(
             context, user_id, retake_session, is_correct, retake_session.get("current_message_id"),
             retake_session.get("current_delivered_at"),
@@ -5229,11 +5272,17 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if session.get("mode") == "batch":
         pending = session.get("pending_polls", {})
-        if poll_id not in pending:
+        pending_item = pending.get(poll_id)
+        if pending_item is None:
             return   # not one of this lecture's questions (or already answered)
-        correct_id, message_id, mid, delivered_at = pending.pop(poll_id)
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == correct_id
+        correct_id, message_id, mid, delivered_at = pending_item
+        status = session.get("poll_status_by_mid", {}).get(mid)
+        option_count = len(status.get("options") or []) if status else None
+        chosen = _validated_option_id(answer, option_count)
+        if chosen is None:
+            return
+        pending.pop(poll_id, None)
+        is_correct = chosen == correct_id
         await _advance_lecture_session(context, user_id, session, is_correct, message_id, mid, delivered_at)
         return
 
@@ -5245,8 +5294,10 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # bank — just the 🤩/😢 reaction — then falls through to delivering
     # the actual next lecture question, same as a normal answer would.
     if session.get("sr_pending_poll_id") == poll_id:
-        chosen     = answer.option_ids[0] if answer.option_ids else None
-        is_correct = chosen is not None and chosen == session.get("sr_pending_correct_id")
+        chosen = _validated_option_id(answer)
+        if chosen is None:
+            return
+        is_correct = chosen == session.get("sr_pending_correct_id")
         sr_message_id = session.get("sr_pending_message_id")
         session.pop("sr_pending", None)
         session.pop("sr_pending_poll_id", None)
@@ -5275,9 +5326,11 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if session.get("current_poll_id") != poll_id:
         return   # not the question we're tracking for this user right now
 
+    chosen = _validated_option_id(answer, session.get("current_option_count"))
+    if chosen is None:
+        return
     session["timeout_streak"] = 0
-    chosen     = answer.option_ids[0] if answer.option_ids else None
-    is_correct = chosen is not None and chosen == session.get("current_correct_id")
+    is_correct = chosen == session.get("current_correct_id")
     await _advance_lecture_session(
         context, user_id, session, is_correct,
         session.get("current_message_id"), session.get("current_mid"),
