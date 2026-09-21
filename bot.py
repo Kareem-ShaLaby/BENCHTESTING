@@ -480,8 +480,12 @@ QUIZZY_ERROR_LINES = [
 def quizzy_block(art: str, line: str) -> str:
     """Quizzy's ASCII art + one of his lines, wrapped for Telegram HTML.
     The art contains literal < > characters (whiskers/paws) which Telegram's
-    HTML parser would otherwise choke on as broken tags — escape them."""
-    return f"<pre>{html.escape(art)}</pre>\n<i>{html.escape(line)}</i>"
+    HTML parser would otherwise choke on as broken tags — escape them.
+    <code> instead of <pre>: a <pre> block gets Telegram's own language
+    auto-detection, and the art's first line reads enough like a shell
+    command that it was showing a "Shell" label + copy button above the
+    cat. <code> keeps the monospace look without that guess."""
+    return f"<code>{html.escape(art)}</code>\n<i>{html.escape(line)}</i>"
 
 # ═══════════════════════════════════════════════════════════════
 # BOT MESSAGES — every user-facing string the bot sends, in one place.
@@ -1056,7 +1060,9 @@ def _format_duration(seconds: float) -> str:
     m, s = divmod(total, 60)
     return f"{m}m {s}s" if m else f"{s}s"
 
-def _year_leaderboard(year_class: str, limit: int = 15) -> list[dict]:
+YEAR_LEADERBOARD_PAGE_SIZE = 20   # rows per page of the global (year_leaderboard) view
+
+def _year_leaderboard(year_class: str, limit: int = 100) -> list[dict]:
     """Top users in one Year/Class cohort (SETTINGS' year_class — see the
     onboarding question, NOT the quiz-browsing YEARS), ranked by all-time
     lecture_questions_correct first (highest first), then by accuracy
@@ -1935,7 +1941,7 @@ async def _record_lecture_result(user_id: int, lecture_key: str, correct: int, t
     }
     await save_lecture_results()
 
-def _lecture_leaderboard(lecture_key: str, limit: int = 10) -> list[dict]:
+def _lecture_leaderboard(lecture_key: str, limit: int = 20) -> list[dict]:
     """Top attempts for this lecture, best % first (ties broken by more
     correct answers, then earlier last_at). Each row also carries the
     nickname (falling back to a generic label if the user never set one)."""
@@ -2240,7 +2246,7 @@ async def restore_mistakes_bank_from_channel(app) -> str:
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY QUIZ — 💥Daily Quiz💥: each day, every configured year gets ONE
-# shared run of DAILY_QUIZ_TOTAL_COUNT (10) random
+# shared run of DAILY_QUIZ_TOTAL_COUNT (15) random
 # questions — built once per (year, day) and then IDENTICAL for every
 # user in that year, so everyone's run (and the leaderboard ranking it
 # feeds) is a level playing field. No mistakes-bank content is used here
@@ -2272,7 +2278,7 @@ DAILY_QUIZ_SESSIONS = {}   # user_id -> {"queue": [question dict, ...], "current
                            #             "year",
                            #             "total", "answered", "correct", "xp_earned"}
 
-DAILY_QUIZ_TOTAL_COUNT = 10   # random questions per year, per day
+DAILY_QUIZ_TOTAL_COUNT = 15   # random questions per year, per day
 
 # ═══════════════════════════════════════════════════════════════
 # DAILY QUIZ LEADERBOARD — deliberately RAM-only, unlike everything else
@@ -2325,13 +2331,13 @@ def _ensure_daily_leaderboard_fresh() -> None:
     DAILY_QUIZ_LEADERBOARD_DATE = today
     DAILY_QUIZ_LEADERBOARD = {}
 
-def _rank_daily_leaderboard(year: str) -> list[dict]:
+def _rank_daily_leaderboard(year: str, limit: int = 20) -> list[dict]:
     """Today's Daily Quiz finishers for one year, ranked the same way as
     the year leaderboard: correct count highest first, total duration
     lowest first as the tiebreaker."""
     rows = list(DAILY_QUIZ_LEADERBOARD.get(year, {}).values())
     rows.sort(key=lambda r: (-r["correct"], r["duration"]))
-    return rows
+    return rows[:limit]
 
 def _record_daily_leaderboard_finish(user_id: int, year: str, correct: int, total: int, duration: float) -> None:
     """Records this user's (one-per-day) finish on today's board for
@@ -2681,7 +2687,7 @@ def _ensure_daily_quiz_questions_fresh() -> None:
         _DAILY_QUIZ_QUESTIONS_DATE = today
 
 async def _build_daily_quiz_questions(context: ContextTypes.DEFAULT_TYPE, year: str) -> list:
-    """Up to DAILY_QUIZ_TOTAL_COUNT (10) questions, drawn
+    """Up to DAILY_QUIZ_TOTAL_COUNT (15) questions, drawn
     at random from `year`'s ready pool — no mistakes-bank content.
     Respects the admin-set /daily_module scope if it's set for this year.
     Falls short gracefully (a shorter, or empty, run) if there isn't
@@ -5691,7 +5697,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = parse_mcq_block(caption)
         if not parsed:
             await update.message.reply_text(
-                "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z)."
+                "⚠️ الكابشن مش صيغة سؤال كاملة (لازم سؤال + اختيارات + إجابة صح متعلّم عليها بـ z).\n\n"
+                "مثال:\n"
+                "<code>What is the powerhouse of the cell?\n"
+                "a) Nucleus\n"
+                "b) Mitochondria z\n"
+                "c) Ribosome</code>",
+                parse_mode=ParseMode.HTML,
             )
             return
         question, raw_options, correct_index, explanation = parsed
@@ -6479,11 +6491,13 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 AWAITING_NICKNAME[real_uid] = "onboarding"
                 await _flow_onboarding_message(
                     update, context, real_uid,
-                    "⚠️ الاسم ده مش مناسب — اكتب اسم تاني.",
+                    quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!"),
+                    parse_mode=ParseMode.HTML,
                 )
             else:
                 await update.message.reply_text(
-                    "⚠️ الاسم ده مش مناسب — جرب اسم تاني.",
+                    quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!"),
+                    parse_mode=ParseMode.HTML,
                     reply_markup=settings_menu_keyboard(real_uid),
                 )
             return
@@ -6618,11 +6632,11 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         "⚠️ <b>الصياغة غلط!</b>\n\n"
                         "الشكل الصح هو:\n"
-                        "<code>السؤال\n"
-                        "a) خيار 1\n"
-                        "b) خيار 2 z  ← علّم الصح بـ z\n"
-                        "c) خيار 3\n"
-                        "ex: الشرح (اختياري)</code>",
+                        "<code>What is the powerhouse of the cell?\n"
+                        "a) Nucleus\n"
+                        "b) Mitochondria z  ← علّم الصح بـ z\n"
+                        "c) Ribosome\n"
+                        "ex: Mitochondria produces the cell's ATP (اختياري)</code>",
                         parse_mode=ParseMode.HTML,
                     )
                 continue
@@ -6632,8 +6646,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if correct_index is None or correct_index >= len(raw_options):
                 await update.message.reply_text(
                     "⚠️ <b>ما فيش إجابة صح!</b>\n\n"
-                    "علّم الإجابة الصحيحة بـ <code>z</code> في نهايتها:\n"
-                    "<code>b) الإجابة الصح z</code>",
+                    "علّم الإجابة الصحيحة بـ <code>z</code> في نهايتها، زي كده:\n"
+                    "<code>b) Mitochondria z</code>",
                     parse_mode=ParseMode.HTML,
                 )
                 continue
@@ -8093,26 +8107,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_mystats(context, user_id, query.message, edit=True)
         return
 
-    if query.data == "year_leaderboard":
+    if query.data == "year_leaderboard" or query.data.startswith("year_leaderboard:"):
         # year_class is guaranteed set by this point — mandatory onboarding
         # (see _onboarding_gate) means no update reaches here otherwise.
+        # Global leaderboard: top 100 overall, paged YEAR_LEADERBOARD_PAGE_SIZE
+        # (20) at a time via Next/Back buttons — see year_leaderboard: callback.
+        page = 1
+        if query.data.startswith("year_leaderboard:"):
+            page = int(query.data.split(":")[1])
         year_class = get_year_class(user_id)
-        rows = _year_leaderboard(year_class)
+        rows = _year_leaderboard(year_class)   # top 100, already sorted
         title = f"🏆 <b>Leaderboard — {year_class_label(year_class)}</b>"
         if not rows:
             text = f"{title}\n\nمفيش حد جاوب أسئلة محاضرات في السنة دي لسه."
+            nav_buttons = []
         else:
+            page_size   = YEAR_LEADERBOARD_PAGE_SIZE
+            total_pages = (len(rows) + page_size - 1) // page_size
+            page        = max(1, min(page, total_pages))
+            start       = (page - 1) * page_size
+            page_rows   = rows[start:start + page_size]
+
             lines = [title]
-            for i, r in enumerate(rows, 1):
+            for i, r in enumerate(page_rows, start + 1):
                 lines.append(
                     f"{i}# {html.escape(r['name'])} — {r['correct']} ✅ · {r['accuracy']:.0f}% دقة"
                 )
             text = "\n".join(lines)
+
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Back", callback_data=f"year_leaderboard:{page - 1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("➡️ Next", callback_data=f"year_leaderboard:{page + 1}"))
+
+        keyboard_rows = ([nav_buttons] if nav_buttons else []) + [[
+            InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
+        ]]
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏠 Back to Home", callback_data="back_home"),
-            ]]),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
         )
         return
 
@@ -9004,8 +9038,8 @@ def _build_previewtxt_sections() -> list[str]:
         + "\n\n[empty nickname during onboarding]\n"
         "⚠️ الاسم فاضي — اكتب اسم تحب أتنادي بيه عليك.\n\n"
         "[vulgar nickname during onboarding]\n"
-        "⚠️ الاسم ده مش مناسب — اكتب اسم تاني.\n\n"
-        "[Year/Class prompt]\n"
+        + quizzy_block(QUIZZY_ANGRY_ART, "do you know that i had to make AN ENTIRE FILTER FOR PEOPLE LIKE YOU?!")
+        + "\n\n[Year/Class prompt]\n"
         + quizzy_block(QUIZZY_HAPPY_ART, "What a lovely name Dr.<nickname> 🥰")
         + "\n\nWhat Year/Class are you currently in?\n\n"
         "(⚠️ Set your class correctly, you can NOT change it again later ⚠️)\n\n"
